@@ -1,4 +1,4 @@
-# tree_pipeline.py
+# inference/tree.py
 # -*- coding: utf-8 -*-
 
 import argparse
@@ -7,7 +7,7 @@ import traceback
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import config
-from inference_common import (
+from inference.common import (
     IndexedCaseReader,
     advance_checkpoint,
     build_output_dir,
@@ -21,7 +21,7 @@ from inference_common import (
     scan_label_root,
     update_last_processed_index,
 )
-from selection_pipeline import (
+from inference.selection import (
     build_tree_summary_for_refiner,
     generate_selection_by_selector,
     load_selection,

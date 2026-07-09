@@ -1,4 +1,4 @@
-# inference_common.py
+# inference/common.py
 # -*- coding: utf-8 -*-
 
 import argparse

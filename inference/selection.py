@@ -1,4 +1,4 @@
-# selection_pipeline.py
+# inference/selection.py
 # -*- coding: utf-8 -*-
 
 import json
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import config
-from inference_common import ensure_dir, load_json, save_json
+from inference.common import ensure_dir, load_json, save_json
 from utils.public_functions import load_alarm_template
 
 

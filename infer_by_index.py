@@ -36,8 +36,8 @@ if hasattr(config, "ASCEND_RT_VISIBLE_DEVICES"):
         config.ASCEND_RT_VISIBLE_DEVICES
     )
 
-from llm_pipeline import llm_infer  # noqa: E402
-from tree_pipeline import tree_infer  # noqa: E402
+from inference.llm import llm_infer  # noqa: E402
+from inference.tree import tree_infer  # noqa: E402
 
 
 # ============================================================

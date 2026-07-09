@@ -50,10 +50,10 @@ Default `all` mode runs Tree and LLM in separate spawn processes to avoid NPU ru
 ## Main files
 
 - `infer_by_index.py`: CLI entrypoint, runtime setup, and process orchestration.
-- `inference_common.py`: shared output, dynamic scanning, incremental state, and index-based case loading.
-- `selection_pipeline.py`: selection normalization plus Selector/Refiner integration.
-- `tree_pipeline.py`: Tree pipeline orchestration, feature extraction, training, and prediction.
-- `llm_pipeline.py`: LLM SOP routing plus Competition/Cooperation orchestration.
+- `inference/common.py`: shared output, dynamic scanning, incremental state, and index-based case loading.
+- `inference/selection.py`: selection normalization plus Selector/Refiner integration.
+- `inference/tree.py`: Tree pipeline orchestration, feature extraction, training, and prediction.
+- `inference/llm.py`: LLM SOP routing plus Competition/Cooperation orchestration.
 - `config.py`: paths and runtime defaults.
 - `utils/public_functions.py`: shared I/O and LLM data loaders.
 - `rule_inferencer/data_process_v3.py`: feature extraction.
@@ -67,7 +67,7 @@ Run:
 
 ```bash
 python -m py_compile infer_by_index.py config.py \
-  inference_common.py selection_pipeline.py tree_pipeline.py llm_pipeline.py \
+  inference/common.py inference/selection.py inference/tree.py inference/llm.py \
   utils/public_functions.py \
   rule_inferencer/data_process_v3.py \
   llm_inference/generator.py \

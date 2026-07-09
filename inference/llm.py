@@ -1,4 +1,4 @@
-# llm_pipeline.py
+# inference/llm.py
 # -*- coding: utf-8 -*-
 
 import argparse
@@ -7,7 +7,7 @@ import traceback
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import config
-from inference_common import (
+from inference.common import (
     IndexedCaseReader,
     advance_checkpoint,
     build_output_dir,
