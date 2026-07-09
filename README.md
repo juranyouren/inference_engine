@@ -59,4 +59,6 @@ python infer_by_index.py --start 60 --end 62
 
 ## 说明
 
-`rule_inferencer/txt2sop.py` 当前是兼容接口版本；Tree 主流程直接在 `infer_by_index.py` 中完成，不依赖它生成最终预测。
+`infer_by_index.py` 当前只保留 CLI、运行时初始化和进程调度。公共增量逻辑在 `inference_common.py`，Selection/Selector/Refiner 在 `selection_pipeline.py`，Tree 主流程在 `tree_pipeline.py`，LLM 主流程在 `llm_pipeline.py`。
+
+`rule_inferencer/txt2sop.py` 当前是兼容接口版本；Tree 主流程不依赖它生成最终预测。
