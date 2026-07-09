@@ -1,0 +1,9 @@
+numpy
+pandas
+scikit-learn
+tqdm
+requests
+torch
+torch-npu
+vllm
+vllm-ascend
