@@ -62,3 +62,38 @@ python infer_by_index.py --start 60 --end 62
 `infer_by_index.py` 当前只保留 CLI、运行时初始化和进程调度。公共增量逻辑在 `inference/common.py`，Selection/Selector/Refiner 在 `inference/selection.py`，Tree 主流程在 `inference/tree.py`，LLM 主流程在 `inference/llm.py`。
 
 `rule_inferencer/txt2sop.py` 当前是兼容接口版本；Tree 主流程不依赖它生成最终预测。
+
+## 三种方法对比实验
+
+独立实验入口不会修改生产增量状态。它会动态扫描类别目录，分别运行 Tree、
+Competition、Cooperation，并把 Top-1/3/5、MRR、平均耗时写入
+`evaluation/metrics.json` 和 `evaluation/metrics.csv`。
+
+```bash
+cd /home/sbp/deployment/inference_engine
+python run_three_method_experiment.py \
+  --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
+```
+
+默认校验 4 个类别、每类 200 条。Tree 使用前 50 条初始化，测试接下来的 50 条，
+再依次用前 100/150 条重训并测试下一个 50 条。每个 Tree 阶段均开启完整的
+Selector -> Refiner -> Tree 流程，产物分别保存在 `tree/selector/`、
+`tree/refiner/`、`tree/tree/`；两种 LLM 方法分别运行全部 200 条。
+三个方法使用独立 spawn 进程，避免 NPU 模型运行时相互污染。
+
+Tree 的每条预测包含 `cot`，记录样本从根节点到叶节点实际经过的判断条件及
+最终叶子类别编号，例如：
+
+```json
+{
+  "cot": {
+    "feature_a <= 1.00 -> feature_b > 0.50": 5
+  }
+}
+```
+
+已有推理结果可只重新评测：
+
+```bash
+python run_three_method_experiment.py --evaluate-only --output-dir /path/to/experiment
+```

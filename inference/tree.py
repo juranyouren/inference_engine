@@ -159,6 +159,34 @@ def save_tree_rules(
     return output_path
 
 
+def build_tree_cot(
+    clf,
+    feature_names: List[str],
+    sample_values,
+    pred_id: Any,
+) -> Dict[str, int]:
+    """Return the exact root-to-leaf decision path used for one prediction."""
+    tree = clf.tree_
+    node_id = 0
+    conditions: List[str] = []
+
+    while tree.children_left[node_id] != tree.children_right[node_id]:
+        feature_idx = int(tree.feature[node_id])
+        threshold = float(tree.threshold[node_id])
+        value = float(sample_values[feature_idx])
+        feature_name = str(feature_names[feature_idx])
+
+        if value <= threshold:
+            conditions.append(f"{feature_name} <= {threshold:.2f}")
+            node_id = int(tree.children_left[node_id])
+        else:
+            conditions.append(f"{feature_name} > {threshold:.2f}")
+            node_id = int(tree.children_right[node_id])
+
+    path = " -> ".join(conditions) if conditions else "(root leaf)"
+    return {path: int(pred_id)}
+
+
 def predict_by_tree(
     infer_cases,
     infer_indices,
@@ -186,6 +214,12 @@ def predict_by_tree(
         X = np.array(X_values)
         pred_id = clf.predict(X)[0]
         pred_top1 = label_encoder.inverse_transform([pred_id])[0]
+        cot = build_tree_cot(
+            clf=clf,
+            feature_names=list(feature_names),
+            sample_values=X[0],
+            pred_id=pred_id,
+        )
 
         pred_rc = [pred_top1]
         pred_scores = []
@@ -228,6 +262,7 @@ def predict_by_tree(
             "pred_top1_rc": pred_top1,
             "pred_rc": pred_rc,
             "pred_scores": pred_scores,
+            "cot": cot,
             "rank": rank,
             "is_correct": is_correct,
             "features": features_list[0] if features_list else None,

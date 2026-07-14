@@ -139,6 +139,10 @@ def save_infer_outputs(
                     item.get("pred_rc", []),
                     ensure_ascii=False,
                 ),
+                "cot": json.dumps(
+                    item.get("cot", {}),
+                    ensure_ascii=False,
+                ),
                 "rank": item.get("rank"),
                 "is_correct": item.get("is_correct"),
             })

@@ -333,6 +333,7 @@ def build_tree_summary_for_refiner(
             "groundtruth": item.get("groundtruth"),
             "pred_top1_rc": item.get("pred_top1_rc"),
             "pred_rc": item.get("pred_rc"),
+            "cot": item.get("cot"),
             "rank": item.get("rank"),
             "features": item.get("features"),
         }
