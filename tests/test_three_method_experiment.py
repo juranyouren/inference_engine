@@ -5,6 +5,7 @@ import unittest
 
 from inference.tree import build_tree_cot
 from run_three_method_experiment import (
+    _validate_scenarios,
     build_arg_parser,
     calculate_metrics,
     evaluate_saved_results,
@@ -13,6 +14,22 @@ from run_three_method_experiment import (
 
 
 class ThreeMethodExperimentTests(unittest.TestCase):
+    def test_experiment_selects_only_indices_51_through_250(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenario_name = "告警A"
+            scenario_dir = os.path.join(root, scenario_name)
+            os.makedirs(scenario_dir)
+            for idx in [1, *range(51, 251), 300]:
+                path = os.path.join(
+                    scenario_dir,
+                    f"{scenario_name}_{idx}_label_test.json",
+                )
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("{}")
+
+            scenarios = _validate_scenarios(root, "all", 1, 200, 51, 250)
+            self.assertEqual(scenarios[0]["indices"], list(range(51, 251)))
+
     def test_tree_cot_records_root_to_leaf_conditions(self):
         class FakeTree:
             children_left = [1, -1, -1]
@@ -34,6 +51,9 @@ class ThreeMethodExperimentTests(unittest.TestCase):
         args = build_arg_parser().parse_args([])
         self.assertEqual(args.selection_source, "selector_refiner")
         self.assertGreater(args.refiner_rounds, 0)
+        self.assertEqual(args.start_index, 51)
+        self.assertEqual(args.end_index, 250)
+        self.assertFalse(hasattr(args, "agentdigest_label_root"))
 
     def test_extracts_last_candidate_json_ranking(self):
         text = '分析中出现 ["无关内容"]，最终答案```json\n["根因B", "根因A"]\n```'

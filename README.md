@@ -75,8 +75,9 @@ python run_three_method_experiment.py \
   --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
 ```
 
-默认校验 4 个类别、每类 200 条。Tree 使用前 50 条初始化，测试接下来的 50 条，
-再依次用前 100/150 条重训并测试下一个 50 条。每个 Tree 阶段均开启完整的
+三种方法统一读取 `anomalydetect_label`，默认校验 4 个类别，并严格使用每类
+索引 51–250（含首尾）的 200 条数据。Tree 使用 51–100 初始化，依次测试
+101–150、151–200、201–250，并在每轮加入已测试数据重新训练。每个 Tree 阶段均开启完整的
 Selector -> Refiner -> Tree 流程，产物分别保存在 `tree/selector/`、
 `tree/refiner/`、`tree/tree/`；两种 LLM 方法分别运行全部 200 条。
 三个方法使用独立 spawn 进程，避免 NPU 模型运行时相互污染。

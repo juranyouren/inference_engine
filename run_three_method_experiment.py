@@ -158,6 +158,8 @@ def _validate_scenarios(
     scenario_arg: str,
     expected_categories: int,
     cases_per_category: int,
+    start_index: int,
+    end_index: int,
 ) -> List[Dict[str, Any]]:
     scenarios = scan_label_root(root, scenario_arg)
     if scenario_arg == "all" and expected_categories > 0:
@@ -167,14 +169,25 @@ def _validate_scenarios(
                 f"{[item['name'] for item in scenarios]}"
             )
     for scenario in scenarios:
-        indices = discover_label_indices(
+        discovered_indices = discover_label_indices(
             scenario["data_dir"],
             scenario["alarm_type"],
         )
+        indices = [
+            idx for idx in discovered_indices
+            if start_index <= idx <= end_index
+        ]
         if cases_per_category > 0 and len(indices) != cases_per_category:
             raise ValueError(
-                f"{scenario['data_dir']} 应有 {cases_per_category} 个 case，"
-                f"实际发现 {len(indices)} 个 label index"
+                f"{scenario['data_dir']} 在闭区间 [{start_index}, {end_index}] "
+                f"应有 {cases_per_category} 个 case，实际发现 {len(indices)} 个 label index"
+            )
+        expected_indices = list(range(start_index, end_index + 1))
+        if indices != expected_indices:
+            missing = sorted(set(expected_indices) - set(indices))
+            raise ValueError(
+                f"{scenario['data_dir']} 的实验索引必须连续覆盖 "
+                f"[{start_index}, {end_index}]，缺失: {missing}"
             )
         scenario["indices"] = indices
     return scenarios
@@ -220,6 +233,8 @@ def _run_tree(args: argparse.Namespace) -> None:
         args.scenario,
         args.expected_categories,
         args.cases_per_category,
+        args.start_index,
+        args.end_index,
     )
     all_results: List[Dict[str, Any]] = []
     runs: List[Dict[str, Any]] = []
@@ -415,10 +430,12 @@ def _run_llm_method(args: argparse.Namespace, method: str) -> None:
     )
 
     scenarios = _validate_scenarios(
-        args.agentdigest_label_root,
+        args.anomalydetect_label_root,
         args.scenario,
         args.expected_categories,
         args.cases_per_category,
+        args.start_index,
+        args.end_index,
     )
     method_dir = os.path.join(args.output_dir, method)
     raw_dir = os.path.join(method_dir, "runs")
@@ -591,10 +608,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=getattr(config, "ANOMALYDETECT_LABEL_ROOT"),
     )
     parser.add_argument(
-        "--agentdigest-label-root",
-        default=getattr(config, "AGENTDIGEST_LABEL_ROOT"),
-    )
-    parser.add_argument(
         "--output-dir",
         default=os.path.join(
             getattr(config, "PREDICT_RES_DIR"),
@@ -604,6 +617,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--expected-categories", type=int, default=4)
     parser.add_argument("--cases-per-category", type=int, default=200)
+    parser.add_argument("--start-index", type=int, default=51)
+    parser.add_argument("--end-index", type=int, default=250)
     parser.add_argument("--block-size", type=int, default=50)
     parser.add_argument(
         "--selection-source",
@@ -635,6 +650,14 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     if args.block_size <= 0:
         raise ValueError("block-size 必须 > 0")
+    if args.start_index > args.end_index:
+        raise ValueError("start-index 不能大于 end-index")
+    window_size = args.end_index - args.start_index + 1
+    if args.cases_per_category != window_size:
+        raise ValueError(
+            "cases-per-category 必须等于闭区间大小: "
+            f"{args.start_index}..{args.end_index} 共 {window_size} 条"
+        )
     if "tree" in args.methods and args.refiner_rounds <= 0:
         raise ValueError("Tree 实验必须开启 Refiner，refiner-rounds 必须 > 0")
     if args.cases_per_category > 0 and args.cases_per_category % args.block_size:
@@ -643,31 +666,15 @@ def main() -> None:
     save_json(vars(args), os.path.join(args.output_dir, "experiment_config.json"))
 
     if not args.evaluate_only:
-        tree_scenarios: List[Dict[str, Any]] = []
-        llm_scenarios: List[Dict[str, Any]] = []
-        if "tree" in args.methods:
-            tree_scenarios = _validate_scenarios(
-                args.anomalydetect_label_root,
-                args.scenario,
-                args.expected_categories,
-                args.cases_per_category,
-            )
-        if any(method in args.methods for method in ("competition", "cooperation")):
-            llm_scenarios = _validate_scenarios(
-                args.agentdigest_label_root,
-                args.scenario,
-                args.expected_categories,
-                args.cases_per_category,
-            )
-        if tree_scenarios and llm_scenarios:
-            tree_names = {item["name"] for item in tree_scenarios}
-            llm_names = {item["name"] for item in llm_scenarios}
-            if tree_names != llm_names:
-                raise ValueError(
-                    "Tree 与 LLM label 根目录的类别不一致: "
-                    f"tree_only={sorted(tree_names - llm_names)}, "
-                    f"llm_only={sorted(llm_names - tree_names)}"
-                )
+        # All three methods intentionally share the exact same source window.
+        _validate_scenarios(
+            args.anomalydetect_label_root,
+            args.scenario,
+            args.expected_categories,
+            args.cases_per_category,
+            args.start_index,
+            args.end_index,
+        )
 
         ctx = mp.get_context("spawn")
         for method in args.methods:
