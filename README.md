@@ -98,3 +98,24 @@ Tree 的每条预测包含 `cot`，记录样本从根节点到叶节点实际经
 ```bash
 python run_three_method_experiment.py --evaluate-only --output-dir /path/to/experiment
 ```
+
+## 按 CSN 补充 root_cause
+
+`fill_root_cause_by_csn.py` 从另一个相同类别目录结构的 label 根目录读取
+`root_cause`，按 `XXX_<idx>_label_<csn>.json` 文件名中的 CSN 匹配并补充到
+`anomalydetect_label`。默认只生成预演报告，不修改 label：
+
+```bash
+python fill_root_cause_by_csn.py /path/to/source_label_root
+```
+
+确认 `anomalydetect_label/root_cause_fill_report.json` 后实际写入并备份：
+
+```bash
+python fill_root_cause_by_csn.py /path/to/source_label_root \
+  --apply \
+  --backup-dir /path/to/root_cause_backup
+```
+
+来源中同一 CSN 对应不同根因、目标缺少 CSN、没有匹配项时不会写入对应文件，
+并默认返回非零退出码。

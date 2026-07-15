@@ -3,17 +3,33 @@ import os
 import tempfile
 import unittest
 
+import config
 from inference.tree import build_tree_cot
 from run_three_method_experiment import (
     _validate_scenarios,
     build_arg_parser,
     calculate_metrics,
+    configure_runtime_environment,
     evaluate_saved_results,
     extract_ranked_categories,
 )
 
 
 class ThreeMethodExperimentTests(unittest.TestCase):
+    def test_configures_ascend_devices_before_model_initialization(self):
+        previous = os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+        try:
+            configure_runtime_environment()
+            self.assertEqual(
+                os.environ["ASCEND_RT_VISIBLE_DEVICES"],
+                str(config.ASCEND_RT_VISIBLE_DEVICES),
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+            else:
+                os.environ["ASCEND_RT_VISIBLE_DEVICES"] = previous
+
     def test_experiment_selects_only_indices_51_through_250(self):
         with tempfile.TemporaryDirectory() as root:
             scenario_name = "告警A"

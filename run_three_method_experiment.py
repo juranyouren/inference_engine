@@ -25,6 +25,20 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 import config  # noqa: E402
+
+
+def configure_runtime_environment() -> None:
+    """Apply the same Ascend runtime environment as the production entrypoint."""
+    if hasattr(config, "ASCEND_RT_VISIBLE_DEVICES"):
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(
+            config.ASCEND_RT_VISIBLE_DEVICES
+        )
+
+
+# Spawned children import this module again, so this runs before any lazy
+# Selector/Refiner/RCAGenerator import can initialize torch_npu or vLLM.
+configure_runtime_environment()
+
 from inference.common import (  # noqa: E402
     IndexedCaseReader,
     discover_label_indices,
