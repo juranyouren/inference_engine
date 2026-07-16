@@ -4,7 +4,9 @@ import tempfile
 import unittest
 
 import config
+from inference.selection import build_tree_summary_for_refiner
 from inference.tree import build_tree_cot
+from llm_inference.selector_refiner import LLMEngine
 from run_three_method_experiment import (
     _validate_scenarios,
     build_arg_parser,
@@ -16,6 +18,50 @@ from run_three_method_experiment import (
 
 
 class ThreeMethodExperimentTests(unittest.TestCase):
+    def test_refiner_prompt_is_limited_with_head_and_tail_preserved(self):
+        class FakeTokenizer:
+            @staticmethod
+            def encode(text, add_special_tokens=False):
+                return [ord(char) for char in text]
+
+            @staticmethod
+            def decode(token_ids, skip_special_tokens=True):
+                return "".join(chr(token_id) for token_id in token_ids)
+
+        class FakeLlm:
+            @staticmethod
+            def get_tokenizer():
+                return FakeTokenizer()
+
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.llm = FakeLlm()
+        engine.max_model_len = 80
+        prompt, stats = engine.fit_prompt(
+            "A" * 50 + "B" * 50,
+            max_output_tokens=20,
+            safety_tokens=10,
+        )
+        self.assertTrue(stats["truncated"])
+        self.assertLessEqual(stats["final_tokens"], 50)
+        self.assertTrue(prompt.startswith("A"))
+        self.assertTrue(prompt.endswith("B"))
+
+    def test_refiner_summary_compacts_cases_and_features(self):
+        results = []
+        for idx in range(30):
+            results.append({
+                "case_idx": idx,
+                "is_correct": False,
+                "features": {f"feature_{n}": n for n in range(100)},
+                "cot": {"feature_99 > 1.00": 1},
+            })
+        summary = build_tree_summary_for_refiner({"summary": {}, "results": results})
+        self.assertEqual(len(summary["wrong_cases"]), config.REFINER_WRONG_CASE_LIMIT)
+        self.assertLessEqual(
+            len(summary["wrong_cases"][0]["important_nonzero_features"]),
+            config.REFINER_FEATURES_PER_CASE,
+        )
+
     def test_configures_ascend_devices_before_model_initialization(self):
         previous = os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
         try:

@@ -95,6 +95,14 @@ SELECTOR_EX_NUM = 1
 REFINER_EX_NUM = 1
 REFINER_ROUNDS = 1
 
+# Selector / Refiner prompt 控制。max_model_len=16384，生成最多 4096 token，
+# 额外预留安全空间给 chat template 和特殊 token。
+SELECTOR_REFINER_MAX_OUTPUT_TOKENS = 4096
+SELECTOR_REFINER_PROMPT_SAFETY_TOKENS = 512
+REFINER_WRONG_CASE_LIMIT = 8
+REFINER_CORRECT_CASE_LIMIT = 2
+REFINER_FEATURES_PER_CASE = 20
+
 
 # ============================================================
 # 文件匹配模式

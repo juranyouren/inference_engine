@@ -307,7 +307,24 @@ def refine_selection_by_tree_summary(
         summary=tree_summary,
     )
 
-    refined_selection = build_selection_from_selector(refiner_result)
+    try:
+        refined_selection = build_selection_from_selector(refiner_result)
+    except ValueError as exc:
+        fallback_path = os.path.join(
+            output_dir,
+            f"refiner_fallback_round_{round_id}.json",
+        )
+        save_json({
+            "reason": str(exc),
+            "fallback": "previous_selection",
+            "previous_selection": previous_selection,
+            "refiner_output_dir": refiner_output_dir,
+        }, fallback_path)
+        print(
+            f"[Refiner] round={round_id} 未输出有效 selection，"
+            f"沿用上一版。详情: {fallback_path}"
+        )
+        refined_selection = previous_selection
 
     save_json(
         refined_selection,
@@ -323,6 +340,33 @@ def refine_selection_by_tree_summary(
 def build_tree_summary_for_refiner(
     tree_payload: Dict[str, Any],
 ) -> Dict[str, Any]:
+    def compact_features(features: Any) -> Dict[str, Any]:
+        if not isinstance(features, dict):
+            return {}
+
+        important = []
+        for name, value in features.items():
+            if isinstance(value, (int, float)):
+                if value == 0:
+                    continue
+                priority = abs(float(value))
+            else:
+                if value is None or value is False:
+                    continue
+                if isinstance(value, str) and not value:
+                    continue
+                if isinstance(value, (list, dict)) and not value:
+                    continue
+                priority = 1.0
+            important.append((priority, str(name), value))
+
+        important.sort(key=lambda item: (-item[0], item[1]))
+        limit = getattr(config, "REFINER_FEATURES_PER_CASE", 20)
+        return {
+            name: value
+            for _priority, name, value in important[:limit]
+        }
+
     wrong_cases = []
     correct_cases = []
 
@@ -335,7 +379,7 @@ def build_tree_summary_for_refiner(
             "pred_rc": item.get("pred_rc"),
             "cot": item.get("cot"),
             "rank": item.get("rank"),
-            "features": item.get("features"),
+            "important_nonzero_features": compact_features(item.get("features")),
         }
 
         if item.get("is_correct") is True:
@@ -345,8 +389,8 @@ def build_tree_summary_for_refiner(
 
     return {
         "summary": tree_payload.get("summary", {}),
-        "wrong_cases": wrong_cases[:20],
-        "correct_cases": correct_cases[:10],
+        "wrong_cases": wrong_cases[:getattr(config, "REFINER_WRONG_CASE_LIMIT", 8)],
+        "correct_cases": correct_cases[:getattr(config, "REFINER_CORRECT_CASE_LIMIT", 2)],
         "note": (
             "wrong_cases 是当前 selection 下决策树预测错误的样本；"
             "Refiner 应优先根据这些样本调整 log/kpi 特征选择。"
