@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import config
 from inference.selection import build_tree_summary_for_refiner
@@ -12,12 +13,22 @@ from run_three_method_experiment import (
     build_arg_parser,
     calculate_metrics,
     configure_runtime_environment,
+    ensure_valid_working_directory,
     evaluate_saved_results,
     extract_ranked_categories,
 )
 
 
 class ThreeMethodExperimentTests(unittest.TestCase):
+    def test_recovers_from_deleted_working_directory_before_spawn(self):
+        with patch(
+            "run_three_method_experiment.os.getcwd",
+            side_effect=FileNotFoundError,
+        ), patch("run_three_method_experiment.os.chdir") as chdir:
+            recovered = ensure_valid_working_directory()
+        chdir.assert_called_once()
+        self.assertTrue(recovered.is_absolute())
+
     def test_refiner_prompt_is_limited_with_head_and_tail_preserved(self):
         class FakeTokenizer:
             @staticmethod

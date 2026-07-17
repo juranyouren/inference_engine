@@ -9,6 +9,8 @@ import logging
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+import config
+
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover
@@ -103,6 +105,67 @@ def mean(values: List[float]):
 # vLLM 调用
 # ============================================================
 
+def _get_vllm_max_model_len(llm) -> int:
+    engine = getattr(llm, "llm_engine", None)
+    for owner in (
+        getattr(engine, "model_config", None),
+        getattr(engine, "scheduler_config", None),
+        engine,
+        llm,
+    ):
+        value = getattr(owner, "max_model_len", None) if owner is not None else None
+        if value:
+            return int(value)
+    return 16384
+
+
+def fit_vllm_inputs(llm, inputs: List[str], sampling_params):
+    """Limit every prompt to model_len - requested output - chat safety."""
+    tokenizer = llm.get_tokenizer()
+    max_model_len = _get_vllm_max_model_len(llm)
+    max_output_tokens = int(getattr(sampling_params, "max_tokens", 4096) or 4096)
+    safety_tokens = int(getattr(config, "LLM_PROMPT_SAFETY_TOKENS", 512))
+    max_input_tokens = max_model_len - max_output_tokens - safety_tokens
+    if max_input_tokens <= 0:
+        raise ValueError(
+            "vLLM token 预算无效: "
+            f"max_model_len={max_model_len}, output={max_output_tokens}, "
+            f"safety={safety_tokens}"
+        )
+
+    fitted_inputs = []
+    stats = []
+    for index, prompt in enumerate(inputs):
+        token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        original_tokens = len(token_ids)
+        truncated = original_tokens > max_input_tokens
+        if truncated:
+            marker_ids = tokenizer.encode(
+                "\n\n[中间过长内容已截断]\n\n",
+                add_special_tokens=False,
+            )
+            content_budget = max_input_tokens - len(marker_ids)
+            if content_budget <= 1:
+                raise ValueError("vLLM 输入预算不足以容纳截断标记")
+            head_count = content_budget // 2
+            tail_count = content_budget - head_count
+            token_ids = token_ids[:head_count] + marker_ids + token_ids[-tail_count:]
+            prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
+            print(
+                f"[vllm_invoke] prompt[{index}] 截断: "
+                f"{original_tokens} -> {len(token_ids)} tokens；"
+                f"模型上限={max_model_len}，输出预留={max_output_tokens}"
+            )
+        fitted_inputs.append(prompt)
+        stats.append({
+            "input_index": index,
+            "original_tokens": original_tokens,
+            "final_tokens": len(token_ids),
+            "max_input_tokens": max_input_tokens,
+            "truncated": truncated,
+        })
+    return fitted_inputs, stats
+
 def vllm_invoke(llm, inputs: List[str], sampling_params, lora_path=None, batch_size: int = 1):
     """
     统一 vLLM chat 调用。
@@ -111,6 +174,7 @@ def vllm_invoke(llm, inputs: List[str], sampling_params, lora_path=None, batch_s
     """
     all_responses = []
     n = getattr(sampling_params, "n", 1)
+    inputs, _prompt_stats = fit_vllm_inputs(llm, inputs, sampling_params)
 
     if lora_path:
         print("insert lora adapter", lora_path)

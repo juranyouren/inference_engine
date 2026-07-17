@@ -119,3 +119,18 @@ python fill_root_cause_by_csn.py /path/to/source_label_root \
 
 来源中同一 CSN 对应不同根因、目标缺少 CSN、没有匹配项时不会写入对应文件，
 并默认返回非零退出码。
+
+## 重新解析并评分 LLM 结果
+
+模型已经跑完但部分结果未正确解析时，不需要重新推理：
+
+```bash
+python reparse_and_score_llm_results.py \
+  --experiment-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
+```
+
+Competition 优先解析最终 Verifier，失败后汇总三个 Reasoner；Cooperation 从最后
+一轮开始依次尝试 Reasoner、Meta，并可向前轮回溯。新结果写入实验目录下的
+`reparsed/`，不会覆盖原始结果，其中 `parse_attempts` 记录每个 case 尝试过的
+回答文件。重新计算的 Top-1/3/5、MRR 和平均时间位于
+`reparsed/evaluation/metrics.json` 与 `metrics.csv`。

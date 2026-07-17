@@ -53,6 +53,16 @@ from inference.common import (  # noqa: E402
 METHODS = ("tree", "competition", "cooperation")
 
 
+def ensure_valid_working_directory() -> Path:
+    """Recover when the shell's cwd was deleted/replaced during deployment."""
+    try:
+        return Path(os.getcwd()).resolve()
+    except FileNotFoundError:
+        os.chdir(CURRENT_DIR)
+        print(f"[Runtime] 当前工作目录已失效，自动切换到: {CURRENT_DIR}")
+        return CURRENT_DIR
+
+
 def _root_cause_category(label_data: Dict[str, Any]) -> str:
     """Read the benchmark truth from label['root_cause']['category']."""
     root_cause = label_data.get("root_cause", {})
@@ -661,6 +671,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # multiprocessing spawn calls os.getcwd() while preparing each child.
+    # An absolute script path alone cannot recover from a deleted shell cwd.
+    ensure_valid_working_directory()
     args = build_arg_parser().parse_args()
     if args.block_size <= 0:
         raise ValueError("block-size 必须 > 0")
