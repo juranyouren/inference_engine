@@ -134,3 +134,15 @@ Competition 优先解析最终 Verifier，失败后汇总三个 Reasoner；Coope
 `reparsed/`，不会覆盖原始结果，其中 `parse_attempts` 记录每个 case 尝试过的
 回答文件。重新计算的 Top-1/3/5、MRR 和平均时间位于
 `reparsed/evaluation/metrics.json` 与 `metrics.csv`。
+
+仍有少量 case 无法解析时，只重跑这些失败项：
+
+```bash
+python rerun_failed_llm_cases.py \
+  --experiment-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
+```
+
+脚本默认只选择 `pred_rc` 为空或 `parse_strategy=unparsed` 的 case；添加
+`--rerun-text-fallback` 可同时重跑低置信度文本兜底结果。原始结果不会被覆盖：
+单独重跑结果位于 `rerun_failed/`，替换失败项后的完整结果和总体评分位于
+`reparsed_after_rerun/`。
