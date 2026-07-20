@@ -24,16 +24,23 @@ class ReparseLlmResultsTests(unittest.TestCase):
             [["A", "B"], ["B", "A"]],
         )
 
-    def test_cooperation_uses_final_round_meta_when_reasoner_has_no_ranking(self):
+    def test_cooperation_uses_only_last_round_meta(self):
+        """Cooperation 只解析最后一轮 Meta，不管 Reasoner。"""
         with tempfile.TemporaryDirectory() as root:
             output_dir = Path(root)
+            # round2 Reasoner 有合法排序，但应该被忽略
             write_text(
                 output_dir / "51" / "round2" / "reasoner" / "raw_responses.txt",
-                "我检查了接口状态，但这里没有根因排序。",
+                '["根因X", "根因Y"]',
             )
             write_text(
                 output_dir / "51" / "round2" / "meta" / "raw_responses.txt",
-                '$$ ["继续检查"], ["根因B", "根因A"] $$',
+                '["根因B", "根因A"]',
+            )
+            # round1 也有 Meta，但不会被用到（只取最后一轮）
+            write_text(
+                output_dir / "51" / "round1" / "meta" / "raw_responses.txt",
+                '["根因C", "根因D"]',
             )
             ranking, strategy, attempts = parse_cooperation_case(
                 output_dir,
@@ -44,17 +51,20 @@ class ReparseLlmResultsTests(unittest.TestCase):
             self.assertIn("cooperation_meta:round2", strategy)
             self.assertTrue(attempts)
 
-    def test_competition_uses_reasoner_consensus_when_verifier_is_invalid(self):
+    def test_competition_only_uses_reasoner_ignores_meta(self):
+        """Competition 只解析 Reasoner，忽略 Meta。"""
         with tempfile.TemporaryDirectory() as root:
             output_dir = Path(root)
             alarm_type = "告警A"
+            # Reasoner 有合法排序
             write_text(
                 output_dir / f"{alarm_type}_analysis_Reasoner_51" / "raw_responses.txt",
-                "Verifier没有给出列表",
+                '["A", "B", "C"]',
             )
+            # Meta 即使有不同排序也应该被忽略
             write_text(
                 output_dir / f"{alarm_type}_analysis_Meta_51" / "raw_responses.txt",
-                '["A", "B", "C"]\n["A", "C", "B"]\n["B", "A", "C"]',
+                '["C", "B", "A"]',
             )
             ranking, strategy, _attempts = parse_competition_case(
                 output_dir,
@@ -62,8 +72,31 @@ class ReparseLlmResultsTests(unittest.TestCase):
                 51,
                 ["A", "B", "C"],
             )
-            self.assertEqual(ranking[0], "A")
-            self.assertIn("competition_reasoners", strategy)
+            self.assertEqual(ranking, ["A", "B", "C"])
+            self.assertIn("competition_reasoner:structured_array", strategy)
+
+    def test_competition_unparsed_when_reasoner_empty(self):
+        """Competition 的 Reasoner 解析失败则不回退到 Meta，直接 unparsed。"""
+        with tempfile.TemporaryDirectory() as root:
+            output_dir = Path(root)
+            alarm_type = "告警A"
+            write_text(
+                output_dir / f"{alarm_type}_analysis_Reasoner_51" / "raw_responses.txt",
+                "没有排序内容",
+            )
+            # Meta 有合法排序，但应该被忽略
+            write_text(
+                output_dir / f"{alarm_type}_analysis_Meta_51" / "raw_responses.txt",
+                '["A", "B", "C"]',
+            )
+            ranking, strategy, _attempts = parse_competition_case(
+                output_dir,
+                alarm_type,
+                51,
+                ["A", "B", "C"],
+            )
+            self.assertEqual(ranking, [])
+            self.assertEqual(strategy, "unparsed")
 
 
 if __name__ == "__main__":

@@ -124,23 +124,6 @@ def _best_ranking(rankings: List[List[str]]) -> List[str]:
     return max(enumerate(rankings), key=lambda item: (len(item[1]), item[0]))[1]
 
 
-def _consensus_ranking(
-    rankings: List[List[str]],
-    candidates: Sequence[str],
-) -> List[str]:
-    if not rankings:
-        return []
-    missing_rank = len(candidates) + 1
-    scores = {}
-    for category in candidates:
-        ranks = [
-            ranking.index(category) + 1 if category in ranking else missing_rank
-            for ranking in rankings
-        ]
-        scores[category] = sum(ranks) / len(ranks)
-    return sorted(candidates, key=lambda category: (scores[category], candidates.index(category)))
-
-
 def _attempt(
     path: Path,
     source: str,
@@ -163,8 +146,6 @@ def _attempt(
     record["ranking_count"] = len(rankings)
     if rankings:
         record["strategy"] = "structured_array"
-        if source == "competition_reasoners":
-            return _consensus_ranking(rankings, candidates), record
         return _best_ranking(rankings), record
     if allow_text:
         ranking = extract_text_ranking(text, candidates)
@@ -185,27 +166,19 @@ def parse_competition_case(
     case_idx: int,
     candidates: Sequence[str],
 ) -> Tuple[List[str], str, List[Dict[str, Any]]]:
-    verifier = output_dir / f"{alarm_type}_analysis_Reasoner_{case_idx}" / "raw_responses.txt"
-    reasoners = output_dir / f"{alarm_type}_analysis_Meta_{case_idx}" / "raw_responses.txt"
+    """Competition 只解析 Reasoner 的结果，不管 Meta。"""
+    reasoner_path = output_dir / f"{alarm_type}_analysis_Reasoner_{case_idx}" / "raw_responses.txt"
     attempts = []
 
-    for path, source in (
-        (verifier, "competition_verifier"),
-        (reasoners, "competition_reasoners"),
-    ):
-        ranking, record = _attempt(path, source, None, candidates, allow_text=False)
-        attempts.append(record)
-        if ranking:
-            return ranking, f"{source}:structured_array", attempts
+    ranking, record = _attempt(reasoner_path, "competition_reasoner", None, candidates, allow_text=False)
+    attempts.append(record)
+    if ranking:
+        return ranking, "competition_reasoner:structured_array", attempts
 
-    for path, source in (
-        (verifier, "competition_verifier"),
-        (reasoners, "competition_reasoners"),
-    ):
-        ranking, record = _attempt(path, source, None, candidates, allow_text=True)
-        attempts.append(record)
-        if ranking:
-            return ranking, f"{source}:candidate_text_fallback", attempts
+    ranking, record = _attempt(reasoner_path, "competition_reasoner", None, candidates, allow_text=True)
+    attempts.append(record)
+    if ranking:
+        return ranking, "competition_reasoner:candidate_text_fallback", attempts
     return [], "unparsed", attempts
 
 
@@ -214,6 +187,7 @@ def parse_cooperation_case(
     case_idx: int,
     candidates: Sequence[str],
 ) -> Tuple[List[str], str, List[Dict[str, Any]]]:
+    """Cooperation 只解析最后一轮的 Meta 结果，不管 Reasoner。"""
     case_dir = output_dir / str(case_idx)
     rounds = sorted(
         [path for path in case_dir.glob("round*") if _round_number(path) >= 0],
@@ -222,24 +196,23 @@ def parse_cooperation_case(
     )
     attempts = []
 
-    # Start at the final round. Reasoner is preferred only when it contains a
-    # real candidate ranking; Meta normally carries the cooperation ranking.
-    for round_dir in rounds:
-        round_id = _round_number(round_dir)
-        sources = (
-            (round_dir / "reasoner" / "raw_responses.txt", "cooperation_reasoner"),
-            (round_dir / "meta" / "raw_responses.txt", "cooperation_meta"),
-        )
-        for path, source in sources:
-            ranking, record = _attempt(path, source, round_id, candidates, allow_text=False)
-            attempts.append(record)
-            if ranking:
-                return ranking, f"{source}:round{round_id}:structured_array", attempts
-        for path, source in sources:
-            ranking, record = _attempt(path, source, round_id, candidates, allow_text=True)
-            attempts.append(record)
-            if ranking:
-                return ranking, f"{source}:round{round_id}:candidate_text_fallback", attempts
+    if not rounds:
+        return [], "unparsed", attempts
+
+    # 只取最后一轮
+    last_round = rounds[0]
+    round_id = _round_number(last_round)
+    meta_path = last_round / "meta" / "raw_responses.txt"
+
+    ranking, record = _attempt(meta_path, "cooperation_meta", round_id, candidates, allow_text=False)
+    attempts.append(record)
+    if ranking:
+        return ranking, f"cooperation_meta:round{round_id}:structured_array", attempts
+
+    ranking, record = _attempt(meta_path, "cooperation_meta", round_id, candidates, allow_text=True)
+    attempts.append(record)
+    if ranking:
+        return ranking, f"cooperation_meta:round{round_id}:candidate_text_fallback", attempts
     return [], "unparsed", attempts
 
 
