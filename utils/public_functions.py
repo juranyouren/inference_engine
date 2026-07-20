@@ -38,6 +38,34 @@ def load_txt(path: str) -> str:
         return f.read()
 
 
+def _truncate_raw_response(text: str, max_chars: Optional[int] = None) -> str:
+    """截断过长的 LLM 原始输出，防止下一轮 prompt 撑爆 token 上限。
+
+    只截日志，不截其他 prompt 内容。
+    max_chars 默认值根据 max_model_len=16384，输出预留 4096 token，
+    safety=512 token。保守给其他 prompt 内容预留 ~5000 token，
+    剩余 ~6000 token 给历史日志，按中文约 1.5 char/token 折算为 9000 字符。
+    """
+    if max_chars is None:
+        max_chars = getattr(config, "RAW_RESPONSE_MAX_CHARS", 9000)
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    return (
+        text[:half]
+        + "\n\n[...日志过长，中间部分已截断...]\n\n"
+        + text[-half:]
+    )
+
+
+def _load_txt_truncated(path: str, max_chars: Optional[int] = None) -> str:
+    """读取文本并在过长时截断，用于加载上一轮 LLM 原始输出。"""
+    text = load_txt(path)
+    if not text:
+        return ""
+    return _truncate_raw_response(text, max_chars)
+
+
 def save_pkl(data: Any, path: str):
     ensure_dir(os.path.dirname(path))
     with open(path, "wb") as f:
@@ -283,7 +311,7 @@ def load_alarm_data_verifier(label_file_path: str, reasoner_output_file: str, al
         alarm_type, semantic_labels, sop, root_cause_candidates, reasoner_outputs
     """
     label_data = load_json(label_file_path)
-    reasoner_outputs = load_txt(reasoner_output_file)
+    reasoner_outputs = _load_txt_truncated(reasoner_output_file)
 
     return {
         "alarm_type": alarm_type,
@@ -311,9 +339,9 @@ def load_alarm_data_meta(
 
     last_outputs = []
     if last_meta_output and os.path.exists(last_meta_output):
-        last_outputs.append("[Last Meta]\n" + load_txt(last_meta_output))
+        last_outputs.append("[Last Meta]\n" + _load_txt_truncated(last_meta_output))
     if last_reasoner_output and os.path.exists(last_reasoner_output):
-        last_outputs.append("[Last Reasoner]\n" + load_txt(last_reasoner_output))
+        last_outputs.append("[Last Reasoner]\n" + _load_txt_truncated(last_reasoner_output))
 
     return {
         "Last_round_outputs": "\n\n".join(last_outputs) if last_outputs else "无上一轮输出。",

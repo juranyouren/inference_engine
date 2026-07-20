@@ -256,7 +256,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="把仅通过 candidate_text_fallback 解析出的低置信度 case 也重跑。",
     )
     parser.add_argument("--rerun-output-dir", default=None)
-    parser.add_argument("--merged-output-dir", default=None)
     return parser
 
 
@@ -266,10 +265,6 @@ def main() -> None:
     args.rerun_output_dir = args.rerun_output_dir or os.path.join(
         args.experiment_dir,
         "rerun_failed",
-    )
-    merged_output_dir = args.merged_output_dir or os.path.join(
-        args.experiment_dir,
-        "reparsed_after_rerun",
     )
 
     baselines = {}
@@ -292,8 +287,18 @@ def main() -> None:
         "total_failed": total_failed,
         "plans": plans,
     }, os.path.join(args.rerun_output_dir, "rerun_plan.json"))
+
+    # 先把 baseline 全量复制到 rerun_output_dir，为每个 method 建立完整基础
+    for method in args.methods:
+        method_dir = os.path.join(args.rerun_output_dir, method)
+        save_json(baselines[method], os.path.join(method_dir, "baseline_backup.json"))
+        save_infer_outputs(baselines[method], method_dir, "all")
+        print(f"[{method}] 基线已复制到: {method_dir}")
+
     if total_failed == 0:
-        print("没有需要重跑的 case。")
+        print("没有需要重跑的 case，rerun_output_dir 即为完整结果。")
+        report = evaluate_saved_results(args.rerun_output_dir, args.methods)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
         return
 
     ctx = mp.get_context("spawn")
@@ -312,9 +317,10 @@ def main() -> None:
             raise RuntimeError(f"{method} 失败 case 重跑异常，exitcode={process.exitcode}")
 
     for method in args.methods:
-        baseline = baselines[method]
         method_dir = os.path.join(args.rerun_output_dir, method)
         manifest_path = os.path.join(method_dir, "rerun_manifest.json")
+        baseline = baselines[method]
+
         if plans[method]:
             manifest = load_json(manifest_path)
             rerun_results = _parse_rerun_results(
@@ -327,47 +333,39 @@ def main() -> None:
             manifest = {"runs": []}
             rerun_results = []
 
-        rerun_payload = {
-            "meta": {
-                "method": method,
-                "rerun_failed_only": True,
-                "runs": manifest.get("runs", []),
-            },
-            "summary": {
-                "requested_count": len(failed_by_method[method]),
-                "parsed_count": sum(bool(item.get("pred_rc")) for item in rerun_results),
-                "unparsed_count": sum(not item.get("pred_rc") for item in rerun_results),
-            },
-            "results": rerun_results,
-        }
-        save_infer_outputs(rerun_payload, method_dir, "all")
-
+        # 用 baseline 打底，填入 rerun 结果，保存为完整结果
         merged_results = merge_results(baseline.get("results", []), rerun_results)
         merged_payload = {
             "meta": {
                 **baseline.get("meta", {}),
                 "rerun_failed_only": True,
-                "rerun_source": method_dir,
                 "runs": baseline.get("meta", {}).get("runs", []) + manifest.get("runs", []),
             },
             "summary": {
                 "processed_count": len(merged_results),
                 "rerun_count": len(rerun_results),
-                "unparsed_count": sum(not item.get("pred_rc") for item in merged_results),
+                "requested_count": len(failed_by_method[method]),
+                "rerun_parsed_count": sum(
+                    bool(item.get("pred_rc")) for item in rerun_results
+                ),
+                "rerun_unparsed_count": sum(
+                    not item.get("pred_rc") for item in rerun_results
+                ),
+                "final_unparsed_count": sum(
+                    not item.get("pred_rc") for item in merged_results
+                ),
             },
             "results": merged_results,
         }
-        save_infer_outputs(
-            merged_payload,
-            os.path.join(merged_output_dir, method),
-            "all",
+        save_infer_outputs(merged_payload, method_dir, "all")
+        print(
+            f"[{method}] 完整结果: {os.path.join(method_dir, 'predictions.json')}  "
+            f"(共 {len(merged_results)} 条，rerun {len(rerun_results)} 条)"
         )
 
-    evaluate_saved_results(args.rerun_output_dir, args.methods)
-    report = evaluate_saved_results(merged_output_dir, args.methods)
+    report = evaluate_saved_results(args.rerun_output_dir, args.methods)
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    print(f"重跑结果: {args.rerun_output_dir}")
-    print(f"合并后全量评分: {merged_output_dir}")
+    print(f"完整结果（含 rerun）: {args.rerun_output_dir}")
 
 
 if __name__ == "__main__":
