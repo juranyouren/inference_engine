@@ -14,7 +14,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.public_functions import vllm_invoke, save_json, save_jsonl
+from utils.public_functions import (
+    fit_prompt_to_token_budget,
+    save_json,
+    save_jsonl,
+    vllm_invoke,
+)
 from llm_inference.prompts import ROLE_PROMPTS
 
 
@@ -53,7 +58,6 @@ class LLMEngine:
         safety_tokens: int,
     ):
         tokenizer = self.llm.get_tokenizer()
-        token_ids = tokenizer.encode(prompt, add_special_tokens=False)
         max_input_tokens = self.max_model_len - max_output_tokens - safety_tokens
         if max_input_tokens <= 0:
             raise ValueError(
@@ -61,22 +65,7 @@ class LLMEngine:
                 f"max_model_len={self.max_model_len}, output={max_output_tokens}, "
                 f"safety={safety_tokens}"
             )
-        original_tokens = len(token_ids)
-        truncated = original_tokens > max_input_tokens
-        if truncated:
-            marker = "\n\n[中间过长内容已截断]\n\n"
-            marker_ids = tokenizer.encode(marker, add_special_tokens=False)
-            content_budget = max_input_tokens - len(marker_ids)
-            head_count = max(1, content_budget // 2)
-            tail_count = max(1, content_budget - head_count)
-            token_ids = token_ids[:head_count] + marker_ids + token_ids[-tail_count:]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
-        return prompt, {
-            "original_tokens": original_tokens,
-            "final_tokens": len(token_ids),
-            "max_input_tokens": max_input_tokens,
-            "truncated": truncated,
-        }
+        return fit_prompt_to_token_budget(tokenizer, prompt, max_input_tokens)
 
     @classmethod
     def get_instance(cls, model_path: str, gpu_memory_utilization: float = 0.9, max_model_len: int = 16384):

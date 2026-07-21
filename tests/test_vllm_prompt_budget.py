@@ -54,6 +54,31 @@ class FakeSamplingParams:
 
 class VllmPromptBudgetTests(unittest.TestCase):
     @patch("config.LLM_PROMPT_SAFETY_TOKENS", 10)
+    def test_fit_inputs_truncates_anomaly_logs_before_prompt(self):
+        llm = FakeLlm()
+        llm.llm_engine = type("LargeEngine", (), {
+            "model_config": type("LargeModelConfig", (), {
+                "max_model_len": 320,
+            })(),
+        })()
+        prompt = (
+            '任务头\n{"semantic_labels":{"anomaly_logs":{"raw":"'
+            + "L" * 300
+            + '"},"sop":"SOP必须保留"}}\n输出格式必须保留'
+        )
+        fitted, stats = fit_vllm_inputs(
+            llm,
+            [prompt],
+            FakeSamplingParams(),
+        )
+
+        self.assertEqual(stats[0]["truncation_strategy"], "anomaly_logs")
+        self.assertIn('"__truncated__": true', fitted[0])
+        self.assertIn("SOP必须保留", fitted[0])
+        self.assertIn("输出格式必须保留", fitted[0])
+        self.assertLessEqual(stats[0]["final_tokens"], 290)
+
+    @patch("config.LLM_PROMPT_SAFETY_TOKENS", 10)
     def test_fit_inputs_preserves_head_and_tail_within_budget(self):
         llm = FakeLlm()
         fitted, stats = fit_vllm_inputs(

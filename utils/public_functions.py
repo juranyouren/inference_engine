@@ -6,6 +6,7 @@ import json
 import glob
 import pickle
 import logging
+import re
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
@@ -147,6 +148,148 @@ def _get_vllm_max_model_len(llm) -> int:
     return 16384
 
 
+def _truncate_anomaly_logs_to_budget(
+    tokenizer,
+    prompt: str,
+    max_input_tokens: int,
+):
+    """Replace an oversized anomaly_logs JSON value with a valid head/tail summary."""
+    candidates = []
+    for key_match in re.finditer(r'"anomaly_logs"\s*:\s*', prompt):
+        value_start = key_match.end()
+        try:
+            value, value_length = json.JSONDecoder().raw_decode(
+                prompt[value_start:]
+            )
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("__truncated__") is True:
+            continue
+        value_end = value_start + value_length
+        raw_logs = prompt[value_start:value_end]
+        log_token_ids = tokenizer.encode(raw_logs, add_special_tokens=False)
+        if log_token_ids:
+            candidates.append((
+                len(log_token_ids),
+                value_start,
+                value_end,
+                log_token_ids,
+            ))
+
+    if not candidates:
+        return prompt, None
+    _size, value_start, value_end, log_token_ids = max(candidates)
+
+    def build_candidate(keep_tokens: int) -> str:
+        head_count = keep_tokens // 2
+        tail_count = keep_tokens - head_count
+        head = tokenizer.decode(
+            log_token_ids[:head_count],
+            skip_special_tokens=True,
+        ) if head_count else ""
+        tail = tokenizer.decode(
+            log_token_ids[-tail_count:],
+            skip_special_tokens=True,
+        ) if tail_count else ""
+        replacement = json.dumps({
+            "__truncated__": True,
+            "__note__": "anomaly_logs 超出 Prompt token 预算，仅保留首尾内容",
+            "__original_token_count__": len(log_token_ids),
+            "__head__": head,
+            "__tail__": tail,
+        }, ensure_ascii=False, indent=2)
+        return prompt[:value_start] + replacement + prompt[value_end:]
+
+    # Find the largest retained log slice that keeps the complete prompt in budget.
+    best_prompt = build_candidate(0)
+    best_tokens = len(tokenizer.encode(best_prompt, add_special_tokens=False))
+    if best_tokens > max_input_tokens:
+        return best_prompt, {
+            "original_log_tokens": len(log_token_ids),
+            "retained_log_tokens": 0,
+        }
+
+    low = 1
+    high = len(log_token_ids) - 1
+    retained = 0
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = build_candidate(middle)
+        candidate_tokens = len(tokenizer.encode(candidate, add_special_tokens=False))
+        if candidate_tokens <= max_input_tokens:
+            best_prompt = candidate
+            retained = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+
+    return best_prompt, {
+        "original_log_tokens": len(log_token_ids),
+        "retained_log_tokens": retained,
+    }
+
+
+def fit_prompt_to_token_budget(
+    tokenizer,
+    prompt: str,
+    max_input_tokens: int,
+):
+    """Fit one prompt, truncating anomaly_logs before whole-prompt fallback."""
+    token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    original_tokens = len(token_ids)
+    strategy = "none"
+    log_stats = None
+
+    if original_tokens > max_input_tokens:
+        truncated_sections = []
+        while len(token_ids) > max_input_tokens:
+            prompt, section_stats = _truncate_anomaly_logs_to_budget(
+                tokenizer,
+                prompt,
+                max_input_tokens,
+            )
+            if section_stats is None:
+                break
+            truncated_sections.append(section_stats)
+            token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        if truncated_sections:
+            strategy = "anomaly_logs"
+            log_stats = {
+                "truncated_log_sections": len(truncated_sections),
+                "original_log_tokens": sum(
+                    item["original_log_tokens"] for item in truncated_sections
+                ),
+                "retained_log_tokens": sum(
+                    item["retained_log_tokens"] for item in truncated_sections
+                ),
+            }
+
+    if len(token_ids) > max_input_tokens:
+        marker_ids = tokenizer.encode(
+            "\n\n[中间过长内容已截断]\n\n",
+            add_special_tokens=False,
+        )
+        content_budget = max_input_tokens - len(marker_ids)
+        if content_budget <= 1:
+            raise ValueError("vLLM 输入预算不足以容纳截断标记")
+        head_count = content_budget // 2
+        tail_count = content_budget - head_count
+        token_ids = token_ids[:head_count] + marker_ids + token_ids[-tail_count:]
+        prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
+        strategy = "whole_prompt_fallback"
+
+    stats = {
+        "original_tokens": original_tokens,
+        "final_tokens": len(token_ids),
+        "max_input_tokens": max_input_tokens,
+        "truncated": original_tokens > max_input_tokens,
+        "truncation_strategy": strategy,
+    }
+    if log_stats is not None:
+        stats.update(log_stats)
+    return prompt, stats
+
+
 def fit_vllm_inputs(llm, inputs: List[str], sampling_params):
     """Limit every prompt to model_len - requested output - chat safety."""
     tokenizer = llm.get_tokenizer()
@@ -164,34 +307,22 @@ def fit_vllm_inputs(llm, inputs: List[str], sampling_params):
     fitted_inputs = []
     stats = []
     for index, prompt in enumerate(inputs):
-        token_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        original_tokens = len(token_ids)
-        truncated = original_tokens > max_input_tokens
-        if truncated:
-            marker_ids = tokenizer.encode(
-                "\n\n[中间过长内容已截断]\n\n",
-                add_special_tokens=False,
-            )
-            content_budget = max_input_tokens - len(marker_ids)
-            if content_budget <= 1:
-                raise ValueError("vLLM 输入预算不足以容纳截断标记")
-            head_count = content_budget // 2
-            tail_count = content_budget - head_count
-            token_ids = token_ids[:head_count] + marker_ids + token_ids[-tail_count:]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
+        prompt, prompt_stats = fit_prompt_to_token_budget(
+            tokenizer,
+            prompt,
+            max_input_tokens,
+        )
+        prompt_stats["input_index"] = index
+        if prompt_stats["truncated"]:
             print(
-                f"[vllm_invoke] prompt[{index}] 截断: "
-                f"{original_tokens} -> {len(token_ids)} tokens；"
+                f"[vllm_invoke] prompt[{index}] 截断策略="
+                f"{prompt_stats['truncation_strategy']}: "
+                f"{prompt_stats['original_tokens']} -> "
+                f"{prompt_stats['final_tokens']} tokens；"
                 f"模型上限={max_model_len}，输出预留={max_output_tokens}"
             )
         fitted_inputs.append(prompt)
-        stats.append({
-            "input_index": index,
-            "original_tokens": original_tokens,
-            "final_tokens": len(token_ids),
-            "max_input_tokens": max_input_tokens,
-            "truncated": truncated,
-        })
+        stats.append(prompt_stats)
     return fitted_inputs, stats
 
 def vllm_invoke(

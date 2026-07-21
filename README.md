@@ -93,7 +93,10 @@ Selector -> Refiner -> Tree 流程，产物分别保存在 `tree/selector/`、
 所有实际送入模型的 prompt 均会保存：Selector/Refiner 使用 `prompt_0.txt`，
 Competition 三路初始推理使用 `prompt_Reasoner1.txt`、`prompt_Reasoner2.txt`、
 `prompt_Reasoner3.txt`，其余 Meta/Reasoner/Verifier 阶段在各自输出目录使用
-`prompt.txt`。
+`prompt.txt`。Prompt 超出模型输入预算时，会优先把 `anomaly_logs` 替换为保留
+首尾内容的结构化截断摘要，确保任务说明、SOP、候选根因和输出格式仍完整；只有
+压缩日志后依然超限，才对整个 Prompt 使用首尾截断兜底。落盘的是最终实际送入
+模型的版本。
 
 Tree 的每条预测包含 `cot`，记录样本从根节点到叶节点实际经过的判断条件及
 最终叶子类别编号，例如：
