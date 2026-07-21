@@ -58,14 +58,17 @@ def llm_find_case_and_label(
 
 
 def get_sop_value_from_label(label_file_path: str) -> Any:
-    """SOP 必须从 label["semantic_labels"]["sop"] 读取。"""
+    """读取 SOP：优先 semantic_labels["sop"]，为空时 fallback 到顶层 label["sop"]。"""
     label_data = load_json(label_file_path)
     semantic_labels = label_data.get("semantic_labels", {})
 
     if not isinstance(semantic_labels, dict):
-        return ""
+        return label_data.get("sop", "")
 
-    return semantic_labels.get("sop", "")
+    sop = semantic_labels.get("sop")
+    if sop is not None and (not isinstance(sop, str) or sop.strip()):
+        return sop
+    return label_data.get("sop", "")
 
 
 def is_non_empty_sop(sop: Any) -> bool:
@@ -76,6 +79,25 @@ def is_non_empty_sop(sop: Any) -> bool:
     if isinstance(sop, (list, dict, tuple, set)):
         return len(sop) > 0
     return bool(str(sop).strip())
+
+
+def require_sop(sop: Any, label_file: str) -> str:
+    """确保 SOP 非空；若缺失则抛出 ValueError 并指明文件路径。"""
+    import json as _json
+
+    sop_str = ""
+    if isinstance(sop, str):
+        sop_str = sop.strip()
+    elif isinstance(sop, (dict, list)):
+        sop_str = _json.dumps(sop, ensure_ascii=False) if sop else ""
+    elif sop is not None:
+        sop_str = str(sop).strip()
+
+    if not sop_str:
+        raise ValueError(
+            f"SOP 为空：{label_file}，请检查 label 数据中是否包含 sop 字段"
+        )
+    return sop_str
 
 
 def split_indices_by_sop(
@@ -117,6 +139,14 @@ def build_competition_alarm_data(
     if not isinstance(semantic_labels, dict):
         semantic_labels = {}
 
+    sop = semantic_labels.get("sop", "")
+    if isinstance(sop, str) and not sop.strip():
+        sop = label_data.get("sop", "")
+    elif sop is None:
+        sop = label_data.get("sop", "")
+
+    require_sop(sop, label_file)
+
     return {
         "alarm_type": alarm_type,
         "semantic_labels": semantic_labels,
@@ -124,7 +154,7 @@ def build_competition_alarm_data(
             "alarm_time",
             semantic_labels.get("alarm_time"),
         ),
-        "sop": semantic_labels.get("sop", ""),
+        "sop": sop,
         "root_cause_candidates": label_data.get("root_cause_candidates", []),
     }
 
@@ -233,7 +263,9 @@ def llm_competition_one_scenario(
                     current_reasoner_file,
                     alarm_type,
                 )
-                verifier_data["sop"] = get_sop_value_from_label(label_file)
+                sop = get_sop_value_from_label(label_file)
+                require_sop(sop, label_file)
+                verifier_data["sop"] = sop
                 verifier_data_list.append(verifier_data)
                 valid_verifier_dirs.append(verifier_output_dirs[pos])
                 valid_verifier_indices.append(idx)
@@ -404,7 +436,9 @@ def llm_cooperation_one_scenario(
                         last_meta_output,
                         last_reasoner_output,
                     )
-                    meta_data["sop"] = get_sop_value_from_label(label_file)
+                    sop = get_sop_value_from_label(label_file)
+                    require_sop(sop, label_file)
+                    meta_data["sop"] = sop
                     meta_data_list.append(meta_data)
                     meta_output_dirs.append(output_dir_meta)
                     meta_indices.append(idx)
