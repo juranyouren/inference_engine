@@ -150,7 +150,11 @@ class RCAGenerator:
             self.llm,
             inputs=input_prompts,
             sampling_params=SamplingParams(temperature=0.5, top_p=0.9, max_tokens=4096),
-            batch_size=16
+            batch_size=16,
+            prompt_output_paths=(
+                [os.path.join(output_dir, "prompt.txt") for output_dir in output_dirs]
+                if output_dirs else None
+            ),
         )
         
         # 保存结果（如果提供了输出目录和索引）
@@ -193,7 +197,11 @@ class RCAGenerator:
             self.llm,
             inputs=input_prompts,
             sampling_params=SamplingParams(temperature=0.5, top_p=0.9, max_tokens=4096),
-            batch_size=16
+            batch_size=16,
+            prompt_output_paths=(
+                [os.path.join(output_dir, "prompt.txt") for output_dir in output_dirs]
+                if output_dirs else None
+            ),
         )
         
         # 保存结果（如果提供了输出目录和索引）
@@ -248,7 +256,14 @@ class RCAGenerator:
                     top_p=config['top_p'],
                     max_tokens=4096
                 ),
-                batch_size=16
+                batch_size=16,
+                prompt_output_paths=(
+                    [
+                        os.path.join(output_dir, f"prompt_{reasoner_name}.txt")
+                        for output_dir in output_dirs
+                    ]
+                    if output_dirs else None
+                ),
             )
             
             # 将响应按case存储
@@ -296,7 +311,11 @@ class RCAGenerator:
             self.llm,
             inputs=input_prompts,
             sampling_params=SamplingParams(temperature=0.5, top_p=0.9, max_tokens=4096),
-            batch_size=16
+            batch_size=16,
+            prompt_output_paths=(
+                [os.path.join(output_dir, "prompt.txt") for output_dir in output_dirs]
+                if output_dirs else None
+            ),
         )
         
         # 保存结果
@@ -337,7 +356,11 @@ class RCAGenerator:
             self.llm,
             inputs=input_prompts,
             sampling_params=SamplingParams(temperature=0.5, top_p=0.9, max_tokens=4096),
-            batch_size=16
+            batch_size=16,
+            prompt_output_paths=(
+                [os.path.join(output_dir, "prompt.txt") for output_dir in output_dirs]
+                if output_dirs else None
+            ),
         )
         
         # 保存结果
@@ -451,7 +474,11 @@ class RCAGenerator:
             self.llm,
             inputs=input_prompts,
             sampling_params=SamplingParams(temperature=0.5, top_p=0.9, max_tokens=4096),
-            batch_size=16
+            batch_size=16,
+            prompt_output_paths=(
+                [os.path.join(output_dir, "prompt.txt") for output_dir in output_dirs]
+                if output_dirs else None
+            ),
         )
         
         # 保存结果

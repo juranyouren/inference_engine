@@ -14,7 +14,6 @@ import argparse
 import csv
 import json
 import multiprocessing as mp
-import re
 import sys
 import time
 from pathlib import Path
@@ -48,9 +47,15 @@ from inference.common import (  # noqa: E402
     save_json,
     scan_label_root,
 )
+from inference.result_parsing import (  # noqa: E402
+    extract_ranked_categories,
+    parse_competition_case,
+    parse_cooperation_case,
+)
 
 
 METHODS = ("tree", "competition", "cooperation")
+TEST_CASES_PER_CATEGORY = 5
 
 
 def ensure_valid_working_directory() -> Path:
@@ -95,61 +100,6 @@ def _deduplicate(values: Iterable[str]) -> List[str]:
     return result
 
 
-def _ranking_from_json_value(value: Any) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    ranking: List[str] = []
-    for item in value:
-        if isinstance(item, str):
-            ranking.append(item)
-        elif isinstance(item, dict) and item.get("category") is not None:
-            ranking.append(str(item["category"]))
-    return _deduplicate(ranking)
-
-
-def extract_ranked_categories(
-    response_text: str,
-    candidates: Sequence[str],
-) -> Tuple[List[str], str]:
-    """Extract the last/best JSON ranking, with a candidate-aware fallback."""
-    decoder = json.JSONDecoder()
-    candidate_set = set(candidates)
-    parsed: List[Tuple[int, int, List[str]]] = []
-
-    for match in re.finditer(r"\[", response_text):
-        try:
-            value, _end = decoder.raw_decode(response_text[match.start():])
-        except json.JSONDecodeError:
-            continue
-        ranking = _ranking_from_json_value(value)
-        if not ranking:
-            continue
-        valid_count = sum(item in candidate_set for item in ranking)
-        parsed.append((valid_count, match.start(), ranking))
-
-    if parsed:
-        _valid_count, _position, ranking = max(
-            parsed,
-            key=lambda item: (item[0], item[1]),
-        )
-        if candidate_set:
-            ranking = [item for item in ranking if item in candidate_set]
-        if ranking:
-            return ranking, "json_array"
-
-    # Some models occasionally omit the JSON brackets.  Restrict the fallback
-    # to the response tail, where the final answer is expected.
-    tail = response_text[-4000:]
-    positions = [
-        (tail.find(category), category)
-        for category in candidates
-        if tail.find(category) >= 0
-    ]
-    if positions:
-        return [item[1] for item in sorted(positions)], "candidate_text_fallback"
-    return [], "unparsed"
-
-
 def _rank_result(
     case_idx: int,
     scenario: Dict[str, Any],
@@ -157,6 +107,7 @@ def _rank_result(
     prediction: Sequence[str],
     response_path: Optional[str],
     parse_strategy: str,
+    parse_attempts: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     label_data = load_json(label_path)
     groundtruth = _root_cause_category(label_data)
@@ -174,6 +125,7 @@ def _rank_result(
         "is_correct": rank == 1,
         "response_file_path": response_path,
         "parse_strategy": parse_strategy,
+        "parse_attempts": parse_attempts or [],
     }
 
 
@@ -242,6 +194,42 @@ def _normalize_tree_result(
     return normalized
 
 
+def build_tree_stage_specs(
+    scenario: Dict[str, Any],
+    args: argparse.Namespace,
+) -> List[Tuple[int, List[int], List[int]]]:
+    """Build train/infer index sets for normal and five-case test runs."""
+    indices = scenario["indices"]
+    if args.test:
+        train_n = int(getattr(config, "TRAIN_N", 50))
+        all_indices = discover_label_indices(
+            scenario["data_dir"],
+            scenario["alarm_type"],
+        )
+        train_candidates = [idx for idx in all_indices if idx < min(indices)]
+        train_indices = train_candidates[-train_n:]
+        if len(train_indices) < train_n:
+            raise ValueError(
+                f"{scenario['name']} 测试模式训练数据不足："
+                f"需要 {train_n} 条早于 {min(indices)} 的数据，"
+                f"实际只有 {len(train_indices)} 条"
+            )
+        return [(1, train_indices, list(indices))]
+
+    if len(indices) < args.block_size * 2:
+        raise ValueError(f"{scenario['name']} 至少需要两个 block 才能做 Tree 实验")
+
+    specs = []
+    for stage, start in enumerate(
+        range(args.block_size, len(indices), args.block_size),
+        start=1,
+    ):
+        infer_indices = indices[start:start + args.block_size]
+        if infer_indices:
+            specs.append((stage, indices[:start], infer_indices))
+    return specs
+
+
 def _run_tree(args: argparse.Namespace) -> None:
     # Lazy imports keep Tree/Selector/Refiner model initialization in this
     # dedicated process and make the three artifact groups explicit.
@@ -265,19 +253,10 @@ def _run_tree(args: argparse.Namespace) -> None:
     method_dir = os.path.join(args.output_dir, "tree")
 
     for scenario in scenarios:
-        indices = scenario["indices"]
-        if len(indices) < args.block_size * 2:
-            raise ValueError(f"{scenario['name']} 至少需要两个 block 才能做 Tree 实验")
-
-        # Block 1 initializes the model; each following block is tested once.
-        for stage, start in enumerate(
-            range(args.block_size, len(indices), args.block_size),
-            start=1,
+        for stage, train_indices, infer_indices in build_tree_stage_specs(
+            scenario,
+            args,
         ):
-            train_indices = indices[:start]
-            infer_indices = indices[start:start + args.block_size]
-            if not infer_indices:
-                continue
 
             reader = IndexedCaseReader(
                 scenario["data_dir"],
@@ -381,31 +360,13 @@ def _run_tree(args: argparse.Namespace) -> None:
             "block_size": args.block_size,
             "selection_source": "selector_refiner",
             "refiner_rounds": args.refiner_rounds,
+            "test_mode": args.test,
             "runs": runs,
         },
         "summary": {"processed_count": len(all_results)},
         "results": all_results,
     }
     save_infer_outputs(payload, method_dir, "all")
-
-
-def _latest_cooperation_response(output_dir: str, idx: int) -> Optional[str]:
-    case_dir = Path(output_dir) / str(idx)
-    reasoner_files = list(case_dir.glob("round*/reasoner/raw_responses.txt"))
-    meta_files = list(case_dir.glob("round*/meta/raw_responses.txt"))
-
-    def round_number(path: Path) -> int:
-        for part in path.parts:
-            match = re.fullmatch(r"round(\d+)", part)
-            if match:
-                return int(match.group(1))
-        return -1
-
-    if reasoner_files:
-        return str(max(reasoner_files, key=round_number))
-    if meta_files:
-        return str(max(meta_files, key=round_number))
-    return None
 
 
 def _llm_results_for_payload(
@@ -422,19 +383,19 @@ def _llm_results_for_payload(
         label_data = load_json(label_path)
         candidates = _candidate_categories(label_data)
         if method == "competition":
-            response_path = os.path.join(
-                output_dir,
-                f"{scenario['alarm_type']}_analysis_Reasoner_{idx}",
-                "raw_responses.txt",
+            prediction, strategy, attempts = parse_competition_case(
+                Path(output_dir),
+                scenario["alarm_type"],
+                idx,
+                candidates,
             )
         else:
-            response_path = _latest_cooperation_response(output_dir, idx)
-
-        response_text = ""
-        if response_path and os.path.exists(response_path):
-            with open(response_path, "r", encoding="utf-8") as f:
-                response_text = f.read()
-        prediction, strategy = extract_ranked_categories(response_text, candidates)
+            prediction, strategy, attempts = parse_cooperation_case(
+                Path(output_dir),
+                idx,
+                candidates,
+            )
+        response_path = attempts[0]["path"] if attempts else None
         results.append(_rank_result(
             idx,
             scenario,
@@ -442,6 +403,7 @@ def _llm_results_for_payload(
             prediction,
             response_path,
             strategy,
+            attempts,
         ))
     return results
 
@@ -516,6 +478,7 @@ def _run_llm_method(args: argparse.Namespace, method: str) -> None:
         "meta": {
             "method": method,
             "forced_llm_mode": method,
+            "test_mode": args.test,
             "model_init_seconds": model_init_seconds,
             "timing_scope": "full per-scenario LLM pipeline; one-time model initialization excluded",
             "runs": runs,
@@ -645,6 +608,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-index", type=int, default=250)
     parser.add_argument("--block-size", type=int, default=50)
     parser.add_argument(
+        "--test",
+        action="store_true",
+        help=(
+            "快速测试：每个类别只评测从 start-index 开始的 5 个 case；"
+            "Tree 使用这些 case 之前的 TRAIN_N 条数据训练。"
+        ),
+    )
+    parser.add_argument(
         "--selection-source",
         choices=["selector_refiner"],
         default="selector_refiner",
@@ -670,11 +641,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_test_mode(args: argparse.Namespace, default_output_dir: str) -> None:
+    if not args.test:
+        return
+
+    args.cases_per_category = TEST_CASES_PER_CATEGORY
+    args.end_index = args.start_index + TEST_CASES_PER_CATEGORY - 1
+    if os.path.abspath(args.output_dir) == os.path.abspath(default_output_dir):
+        args.output_dir = os.path.join(default_output_dir, "test_5")
+
+
 def main() -> None:
     # multiprocessing spawn calls os.getcwd() while preparing each child.
     # An absolute script path alone cannot recover from a deleted shell cwd.
     ensure_valid_working_directory()
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    apply_test_mode(args, parser.get_default("output_dir"))
     if args.block_size <= 0:
         raise ValueError("block-size 必须 > 0")
     if args.start_index > args.end_index:
@@ -687,7 +670,11 @@ def main() -> None:
         )
     if "tree" in args.methods and args.refiner_rounds <= 0:
         raise ValueError("Tree 实验必须开启 Refiner，refiner-rounds 必须 > 0")
-    if args.cases_per_category > 0 and args.cases_per_category % args.block_size:
+    if (
+        not args.test
+        and args.cases_per_category > 0
+        and args.cases_per_category % args.block_size
+    ):
         raise ValueError("cases-per-category 必须能被 block-size 整除")
     ensure_dir(args.output_dir)
     save_json(vars(args), os.path.join(args.output_dir, "experiment_config.json"))

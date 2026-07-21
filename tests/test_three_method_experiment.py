@@ -9,8 +9,11 @@ from inference.selection import build_tree_summary_for_refiner
 from inference.tree import build_tree_cot
 from llm_inference.selector_refiner import LLMEngine
 from run_three_method_experiment import (
+    _llm_results_for_payload,
     _validate_scenarios,
+    apply_test_mode,
     build_arg_parser,
+    build_tree_stage_specs,
     calculate_metrics,
     configure_runtime_environment,
     ensure_valid_working_directory,
@@ -128,16 +131,104 @@ class ThreeMethodExperimentTests(unittest.TestCase):
         self.assertEqual(args.end_index, 250)
         self.assertFalse(hasattr(args, "agentdigest_label_root"))
 
+    def test_test_mode_limits_each_category_to_five_cases(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(["--test"])
+        default_output_dir = parser.get_default("output_dir")
+        apply_test_mode(args, default_output_dir)
+
+        self.assertEqual(args.cases_per_category, 5)
+        self.assertEqual(args.start_index, 51)
+        self.assertEqual(args.end_index, 55)
+        self.assertEqual(args.output_dir, os.path.join(default_output_dir, "test_5"))
+
+    def test_tree_test_mode_trains_on_previous_fifty_and_infers_five(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenario_name = "告警A"
+            for idx in range(1, 56):
+                with open(
+                    os.path.join(root, f"{scenario_name}_{idx}_label_test.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    f.write("{}")
+
+            parser = build_arg_parser()
+            args = parser.parse_args(["--test"])
+            apply_test_mode(args, parser.get_default("output_dir"))
+            specs = build_tree_stage_specs({
+                "name": scenario_name,
+                "alarm_type": scenario_name,
+                "data_dir": root,
+                "indices": list(range(51, 56)),
+            }, args)
+
+        self.assertEqual(specs, [(1, list(range(1, 51)), list(range(51, 56)))])
+
     def test_extracts_last_candidate_json_ranking(self):
         text = '分析中出现 ["无关内容"]，最终答案```json\n["根因B", "根因A"]\n```'
         ranking, strategy = extract_ranked_categories(text, ["根因A", "根因B"])
         self.assertEqual(ranking, ["根因B", "根因A"])
-        self.assertEqual(strategy, "json_array")
+        self.assertEqual(strategy, "structured_array")
 
     def test_extracts_category_objects(self):
         text = json.dumps([{"category": "根因A"}, {"category": "根因B"}])
         ranking, _strategy = extract_ranked_categories(text, ["根因A", "根因B"])
         self.assertEqual(ranking, ["根因A", "根因B"])
+
+    def test_initial_experiment_uses_last_cooperation_meta(self):
+        with tempfile.TemporaryDirectory() as root:
+            scenario_name = "告警A"
+            data_dir = os.path.join(root, "labels")
+            output_dir = os.path.join(root, "outputs")
+            os.makedirs(data_dir)
+
+            label_path = os.path.join(
+                data_dir,
+                f"{scenario_name}_51_label_test.json",
+            )
+            with open(label_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "root_cause": {"category": "根因B"},
+                    "root_cause_candidates": [
+                        {"category": "根因A"},
+                        {"category": "根因B"},
+                    ],
+                }, f, ensure_ascii=False)
+
+            meta_dir = os.path.join(output_dir, "51", "round2", "meta")
+            reasoner_dir = os.path.join(output_dir, "51", "round2", "reasoner")
+            os.makedirs(meta_dir)
+            os.makedirs(reasoner_dir)
+            with open(
+                os.path.join(meta_dir, "raw_responses.txt"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write('["根因B", "根因A"]')
+            with open(
+                os.path.join(reasoner_dir, "raw_responses.txt"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write('["根因A", "根因B"]')
+
+            results = _llm_results_for_payload(
+                {
+                    "meta": {"output_dir": output_dir},
+                    "summary": {"processed_indices": [51]},
+                },
+                {
+                    "name": scenario_name,
+                    "alarm_type": scenario_name,
+                    "data_dir": data_dir,
+                },
+                "cooperation",
+            )
+
+            self.assertEqual(results[0]["pred_rc"], ["根因B", "根因A"])
+            self.assertIn("cooperation_meta:round2", results[0]["parse_strategy"])
+            self.assertTrue(results[0]["parse_attempts"])
 
     def test_metrics_count_missing_prediction_as_miss(self):
         results = [

@@ -194,15 +194,31 @@ def fit_vllm_inputs(llm, inputs: List[str], sampling_params):
         })
     return fitted_inputs, stats
 
-def vllm_invoke(llm, inputs: List[str], sampling_params, lora_path=None, batch_size: int = 1):
+def vllm_invoke(
+    llm,
+    inputs: List[str],
+    sampling_params,
+    lora_path=None,
+    batch_size: int = 1,
+    prompt_output_paths: Optional[List[str]] = None,
+):
     """
     统一 vLLM chat 调用。
 
     sampling_params.n > 1 时，返回 list[list[str]]；否则返回 list[str]。
+    prompt_output_paths 用于保存经过 token 预算处理、实际送入模型的 prompt。
     """
     all_responses = []
     n = getattr(sampling_params, "n", 1)
     inputs, _prompt_stats = fit_vllm_inputs(llm, inputs, sampling_params)
+    if prompt_output_paths is not None:
+        if len(prompt_output_paths) != len(inputs):
+            raise ValueError(
+                "prompt 输出路径数量必须与输入数量一致: "
+                f"paths={len(prompt_output_paths)}, inputs={len(inputs)}"
+            )
+        for prompt, path in zip(inputs, prompt_output_paths):
+            save_txt(prompt, path)
 
     if lora_path:
         print("insert lora adapter", lora_path)

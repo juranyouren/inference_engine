@@ -75,12 +75,25 @@ python run_three_method_experiment.py \
   --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
 ```
 
+快速验证时可让三种方法在每个类别上只评测 5 个 case。默认使用索引 51–55；
+Tree 另外使用索引 1–50 训练，但只对这 5 个 case 计时和评分：
+
+```bash
+python run_three_method_experiment.py --test
+```
+
+未显式指定 `--output-dir` 时，测试结果写入默认实验目录的 `test_5/` 子目录。
+
 三种方法统一读取 `anomalydetect_label`，默认校验 4 个类别，并严格使用每类
 索引 51–250（含首尾）的 200 条数据。Tree 使用 51–100 初始化，依次测试
 101–150、151–200、201–250，并在每轮加入已测试数据重新训练。每个 Tree 阶段均开启完整的
 Selector -> Refiner -> Tree 流程，产物分别保存在 `tree/selector/`、
 `tree/refiner/`、`tree/tree/`；两种 LLM 方法分别运行全部 200 条。
 三个方法使用独立 spawn 进程，避免 NPU 模型运行时相互污染。
+所有实际送入模型的 prompt 均会保存：Selector/Refiner 使用 `prompt_0.txt`，
+Competition 三路初始推理使用 `prompt_Reasoner1.txt`、`prompt_Reasoner2.txt`、
+`prompt_Reasoner3.txt`，其余 Meta/Reasoner/Verifier 阶段在各自输出目录使用
+`prompt.txt`。
 
 Tree 的每条预测包含 `cot`，记录样本从根节点到叶节点实际经过的判断条件及
 最终叶子类别编号，例如：
@@ -129,8 +142,9 @@ python reparse_and_score_llm_results.py \
   --experiment-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
 ```
 
-Competition 优先解析最终 Verifier，失败后汇总三个 Reasoner；Cooperation 从最后
-一轮开始依次尝试 Reasoner、Meta，并可向前轮回溯。新结果写入实验目录下的
+首次实验和重新解析使用同一套策略：Competition 只解析最终 Verifier；
+Cooperation 只解析最后一轮 Meta。结构化数组解析失败后，才按最终回答中的
+候选根因出现顺序进行文本兜底，不向其他输出或更早轮次回溯。新结果写入实验目录下的
 `reparsed/`，不会覆盖原始结果，其中 `parse_attempts` 记录每个 case 尝试过的
 回答文件。重新计算的 Top-1/3/5、MRR 和平均时间位于
 `reparsed/evaluation/metrics.json` 与 `metrics.csv`。

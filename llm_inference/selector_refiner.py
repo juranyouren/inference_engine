@@ -180,6 +180,10 @@ class Selector(RCARole):
             inputs=inputs,
             sampling_params=SamplingParams(temperature=0.8, top_p=0.9, max_tokens=max_tokens, n=2),
             batch_size=batch,
+            prompt_output_paths=[
+                os.path.join(output_dir, f"prompt_{idx}.txt")
+                for idx in range(len(inputs))
+            ],
         )
 
         records = []
@@ -225,6 +229,10 @@ class Refiner(RCARole):
             inputs=inputs,
             sampling_params=SamplingParams(temperature=0.8, top_p=0.9, max_tokens=max_tokens, n=3),
             batch_size=batch,
+            prompt_output_paths=[
+                os.path.join(output_dir, f"prompt_{idx}.txt")
+                for idx in range(len(inputs))
+            ],
         )
 
         records = []

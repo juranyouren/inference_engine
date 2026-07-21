@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -76,6 +78,25 @@ class VllmPromptBudgetTests(unittest.TestCase):
         sent = llm.received_prompts[0][0]["content"]
         self.assertLessEqual(len(FakeTokenizer.encode(sent)), 50)
         self.assertEqual(responses, ["ok"])
+
+    @patch("config.LLM_PROMPT_SAFETY_TOKENS", 10)
+    def test_vllm_invoke_saves_exact_fitted_prompt(self):
+        llm = FakeLlm()
+        with tempfile.TemporaryDirectory() as root:
+            prompt_path = os.path.join(root, "case", "prompt.txt")
+            vllm_invoke(
+                llm,
+                ["X" * 100],
+                FakeSamplingParams(),
+                batch_size=1,
+                prompt_output_paths=[prompt_path],
+            )
+            with open(prompt_path, "r", encoding="utf-8") as f:
+                saved = f.read()
+
+        sent = llm.received_prompts[0][0]["content"]
+        self.assertEqual(saved, sent)
+        self.assertLessEqual(len(FakeTokenizer.encode(saved)), 50)
 
 
 if __name__ == "__main__":
