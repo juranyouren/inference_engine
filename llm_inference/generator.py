@@ -30,6 +30,16 @@ class RCAGenerator:
         )
         print(f"LLM模型已初始化: {self.model_path}")
 
+    @staticmethod
+    def _filter_semantic_labels_for_prompt(alarm_type, semantic_labels):
+        """对于入方向带宽利用率过高，不把日志(anomaly_logs)放进prompt。"""
+        if alarm_type == "入方向带宽利用率过高":
+            filtered = dict(semantic_labels)
+            if "anomaly_logs" in filtered:
+                filtered["anomaly_logs"] = {}
+            return filtered
+        return semantic_labels
+
     def generate_rca_analysis(self, alarm_data_list, output_dir,batch_indices):
         """
         批量生成根因分析
@@ -48,7 +58,10 @@ class RCAGenerator:
         for alarm_data in alarm_data_list:
             input_prompt = ROOT_CAUSE_META.format(
                 alarm_type=alarm_data['alarm_type'],
-                semantic_labels=json.dumps(alarm_data['semantic_labels'], ensure_ascii=False, indent=2),
+                semantic_labels=json.dumps(
+                    self._filter_semantic_labels_for_prompt(alarm_data['alarm_type'], alarm_data['semantic_labels']),
+                    ensure_ascii=False, indent=2,
+                ),
                 alarm_time=alarm_data["alarm_time"],
                 sop=alarm_data['sop'],
                 # sop='',
@@ -87,7 +100,10 @@ class RCAGenerator:
         for alarm_data in alarm_data_list:
             input_prompt = ROOT_CAUSE_NAIVE.format(
                 alarm_type=alarm_data['alarm_type'],
-                semantic_labels=json.dumps(alarm_data['semantic_labels'], ensure_ascii=False, indent=2),
+                semantic_labels=json.dumps(
+                    self._filter_semantic_labels_for_prompt(alarm_data['alarm_type'], alarm_data['semantic_labels']),
+                    ensure_ascii=False, indent=2,
+                ),
                 alarm_time=alarm_data['alarm_time'],
                 sop=alarm_data['sop'],
                 # sop='',
@@ -187,7 +203,10 @@ class RCAGenerator:
                 meta_output=alarm_data['meta_output'],
                 alarm_type=alarm_data['alarm_type'],
                 alarm_time=alarm_data['alarm_time'],
-                semantic_labels=json.dumps(alarm_data['semantic_labels'], ensure_ascii=False, indent=2),
+                semantic_labels=json.dumps(
+                    self._filter_semantic_labels_for_prompt(alarm_data['alarm_type'], alarm_data['semantic_labels']),
+                    ensure_ascii=False, indent=2,
+                ),
                 root_cause_candidates=json.dumps(alarm_data['root_cause_candidates'], ensure_ascii=False, indent=2)
             )
             input_prompts.append(input_prompt)
@@ -239,7 +258,10 @@ class RCAGenerator:
             for alarm_data in alarm_data_list:
                 input_prompt = ROOT_CAUSE_Reasoner1.format(
                     alarm_type=alarm_data['alarm_type'],
-                    semantic_labels=json.dumps(alarm_data['semantic_labels'], ensure_ascii=False, indent=2),
+                    semantic_labels=json.dumps(
+                        self._filter_semantic_labels_for_prompt(alarm_data['alarm_type'], alarm_data['semantic_labels']),
+                        ensure_ascii=False, indent=2,
+                    ),
                     alarm_time=alarm_data['alarm_time'],
                     # sop="",
                     sop=alarm_data['sop'],
@@ -298,7 +320,10 @@ class RCAGenerator:
         for alarm_data in alarm_data_list:
             input_prompt = ROOT_CAUSE_Verifier.format(
                 alarm_type=alarm_data['alarm_type'],
-                semantic_labels=json.dumps(alarm_data['semantic_labels'], ensure_ascii=False, indent=2),
+                semantic_labels=json.dumps(
+                    self._filter_semantic_labels_for_prompt(alarm_data['alarm_type'], alarm_data['semantic_labels']),
+                    ensure_ascii=False, indent=2,
+                ),
                 # sop='',
                 sop=alarm_data['sop'],
                 root_cause_candidates=json.dumps(alarm_data['root_cause_candidates'], ensure_ascii=False, indent=2),
@@ -404,7 +429,10 @@ class RCAGenerator:
             for alarm_data in alarm_data_list:
                 input_prompt = ROOT_CAUSE_Reasoner_Coopetiton.format(
                     alarm_type=alarm_data['alarm_type'],
-                    semantic_labels=json.dumps(alarm_data['semantic_labels'], ensure_ascii=False, indent=2),
+                    semantic_labels=json.dumps(
+                        self._filter_semantic_labels_for_prompt(alarm_data['alarm_type'], alarm_data['semantic_labels']),
+                        ensure_ascii=False, indent=2,
+                    ),
                     alarm_time=alarm_data['alarm_time'],
                     meta_output=alarm_data['meta_output'],
                     root_cause_candidates=json.dumps(alarm_data['root_cause_candidates'], ensure_ascii=False, indent=2)
@@ -462,7 +490,10 @@ class RCAGenerator:
         for alarm_data in alarm_data_list:
             input_prompt = ROOT_CAUSE_Verifier_Coopetiton.format(
                 alarm_type=alarm_data['alarm_type'],
-                semantic_labels=json.dumps(alarm_data['semantic_labels'], ensure_ascii=False, indent=2),
+                semantic_labels=json.dumps(
+                    self._filter_semantic_labels_for_prompt(alarm_data['alarm_type'], alarm_data['semantic_labels']),
+                    ensure_ascii=False, indent=2,
+                ),
                 meta_output=alarm_data['meta_output'],
                 root_cause_candidates=json.dumps(alarm_data['root_cause_candidates'], ensure_ascii=False, indent=2),
                 reasoner_outputs=alarm_data['reasoner_outputs']
