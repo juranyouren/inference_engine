@@ -436,9 +436,7 @@ def llm_cooperation_one_scenario(
                         last_meta_output,
                         last_reasoner_output,
                     )
-                    sop = get_sop_value_from_label(label_file)
-                    require_sop(sop, label_file)
-                    meta_data["sop"] = sop
+                    meta_data["sop"] = ""
                     meta_data_list.append(meta_data)
                     meta_output_dirs.append(output_dir_meta)
                     meta_indices.append(idx)
