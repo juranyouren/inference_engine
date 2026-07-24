@@ -29,8 +29,9 @@ import config  # noqa: E402
 def configure_runtime_environment() -> None:
     """Apply the same Ascend runtime environment as the production entrypoint."""
     if hasattr(config, "ASCEND_RT_VISIBLE_DEVICES"):
-        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(
-            config.ASCEND_RT_VISIBLE_DEVICES
+        os.environ.setdefault(
+            "ASCEND_RT_VISIBLE_DEVICES",
+            str(config.ASCEND_RT_VISIBLE_DEVICES),
         )
 
 
@@ -303,6 +304,8 @@ def _run_tree(args: argparse.Namespace) -> None:
                     output_dir=interim_tree_dir,
                     output_format="json",
                     tag=f"before_refiner_round_{round_id}",
+                    enable_val=args.tree_val,
+                    val_depths=args.tree_val_depths,
                 )
                 tree_summary = build_tree_summary_for_refiner(interim_payload)
                 save_json(tree_summary, os.path.join(round_dir, "tree_summary.json"))
@@ -328,6 +331,8 @@ def _run_tree(args: argparse.Namespace) -> None:
                 output_dir=final_tree_dir,
                 output_format=args.output_format,
                 tag="final_after_refiner",
+                enable_val=args.tree_val,
+                val_depths=args.tree_val_depths,
             )
             tree_seconds = time.perf_counter() - tree_started
             elapsed = selector_seconds + refiner_seconds + tree_seconds
@@ -347,6 +352,8 @@ def _run_tree(args: argparse.Namespace) -> None:
                 "selector_seconds": selector_seconds,
                 "refiner_seconds": refiner_seconds,
                 "tree_seconds": tree_seconds,
+                "tree_val_enabled": args.tree_val,
+                "tree_validation": payload.get("validation"),
                 "selector_output_dir": selector_dir,
                 "refiner_output_dir": refiner_dir,
                 "tree_output_dir": final_tree_dir,
@@ -360,6 +367,8 @@ def _run_tree(args: argparse.Namespace) -> None:
             "block_size": args.block_size,
             "selection_source": "selector_refiner",
             "refiner_rounds": args.refiner_rounds,
+            "tree_val_enabled": args.tree_val,
+            "tree_val_depths": args.tree_val_depths,
             "test_mode": args.test,
             "runs": runs,
         },
@@ -625,6 +634,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--refiner-rounds",
         type=int,
         default=getattr(config, "REFINER_ROUNDS", 1),
+    )
+    tree_val_group = parser.add_mutually_exclusive_group()
+    tree_val_group.add_argument(
+        "--tree-val",
+        dest="tree_val",
+        action="store_true",
+        help="Tree 在每个 infer block 上比较候选 max_depth 并选择验证准确率最高者。",
+    )
+    tree_val_group.add_argument(
+        "--no-tree-val",
+        dest="tree_val",
+        action="store_false",
+        help="Tree 固定使用 config.MAX_DEPTH。",
+    )
+    parser.set_defaults(
+        tree_val=getattr(config, "TREE_VAL_ENABLED", False),
+    )
+    parser.add_argument(
+        "--tree-val-depths",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="DEPTH",
+        help="Tree val 候选深度；默认读取 config.TREE_VAL_MAX_DEPTH_CANDIDATES。",
     )
     parser.add_argument("--batch-size", type=int, default=getattr(config, "BATCH_SIZE", 16))
     parser.add_argument(

@@ -32,8 +32,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 if hasattr(config, "ASCEND_RT_VISIBLE_DEVICES"):
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(
-        config.ASCEND_RT_VISIBLE_DEVICES
+    os.environ.setdefault(
+        "ASCEND_RT_VISIBLE_DEVICES",
+        str(config.ASCEND_RT_VISIBLE_DEVICES),
     )
 
 from inference.llm import llm_infer  # noqa: E402
@@ -132,6 +133,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Tree 使用当前新增数据之前最近多少条样本训练。",
+    )
+
+    tree_val_group = parser.add_mutually_exclusive_group()
+    tree_val_group.add_argument(
+        "--tree-val",
+        dest="tree_val",
+        action="store_true",
+        help=(
+            "启用 Tree 验证选深度：在当前 infer 窗口上比较候选 "
+            "max_depth，并使用准确率最高的树。"
+        ),
+    )
+    tree_val_group.add_argument(
+        "--no-tree-val",
+        dest="tree_val",
+        action="store_false",
+        help="关闭 Tree 验证选深度，固定使用 config.MAX_DEPTH。",
+    )
+    parser.set_defaults(
+        tree_val=getattr(config, "TREE_VAL_ENABLED", False),
+    )
+
+    parser.add_argument(
+        "--tree-val-depths",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="DEPTH",
+        help=(
+            "Tree val 的候选 max_depth；默认使用 "
+            "config.TREE_VAL_MAX_DEPTH_CANDIDATES。"
+        ),
     )
 
     parser.add_argument(

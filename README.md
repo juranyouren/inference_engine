@@ -39,6 +39,10 @@ python infer_by_index.py --infer-type llm_infer
 # 只跑 Tree
 python infer_by_index.py --infer-type tree_infer
 
+# 只跑 Tree，并在当前推理窗口上启用验证选深度
+python infer_by_index.py --infer-type tree_infer \
+  --tree-val --tree-val-depths 2 3 4 5
+
 # 只处理一个类别
 python infer_by_index.py --scenario 网络设备掉线
 
@@ -74,6 +78,19 @@ cd /home/sbp/deployment/inference_engine
 python run_three_method_experiment.py \
   --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
 ```
+
+只重跑 Tree 并启用验证选深度：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python run_three_method_experiment.py \
+  --methods tree \
+  --tree-val \
+  --tree-val-depths 2 3 4 5 \
+  --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/tree_val
+```
+
+`--tree-val` 会把当前 Tree 的 infer block 当作验证集来选择深度，行为与
+`tree_val.py` 的验证窗口一致。因此该模式适合离线实验；生产增量推理默认关闭。
 
 快速验证时可让三种方法在每个类别上只评测 5 个 case。默认使用索引 51–55；
 Tree 另外使用索引 1–50 训练，但只对这 5 个 case 计时和评分：

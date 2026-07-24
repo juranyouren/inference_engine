@@ -84,6 +84,10 @@ MAX_DEPTH = 3
 MIN_SAMPLES_LEAF = 10
 RANDOM_STATE = 42
 
+# 默认关闭，保持原 Tree 行为。启用后会在当前 infer 窗口上比较候选深度。
+TREE_VAL_ENABLED = False
+TREE_VAL_MAX_DEPTH_CANDIDATES = [2, 3, 4, 5]
+
 # 可选：file / selector / selector_refiner
 # 推荐生产环境先用 file；需要在线生成 selection 时改成 selector_refiner。
 SELECTION_SOURCE = "file"
