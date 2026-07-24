@@ -105,6 +105,7 @@ def extract_labels(
 def train_tree_model(
     train_cases: List[Dict[str, Any]],
     selection: Dict[str, Any],
+    max_depth: Optional[int] = None,
 ):
     np, _LabelEncoder, DecisionTreeClassifier, _export_text = (
         _load_tree_dependencies()
@@ -116,7 +117,11 @@ def train_tree_model(
     y_train, label_encoder = extract_labels(train_cases)
 
     clf = DecisionTreeClassifier(
-        max_depth=getattr(config, "MAX_DEPTH", 3),
+        max_depth=(
+            max_depth
+            if max_depth is not None
+            else getattr(config, "MAX_DEPTH", 3)
+        ),
         min_samples_leaf=getattr(config, "MIN_SAMPLES_LEAF", 10),
         random_state=getattr(config, "RANDOM_STATE", 42),
     )
@@ -271,6 +276,131 @@ def predict_by_tree(
     return results
 
 
+def summarize_tree_accuracy(
+    results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    labeled = [
+        item for item in results
+        if item.get("is_correct") is not None
+    ]
+    correct = sum(
+        1 for item in labeled
+        if item.get("is_correct") is True
+    )
+    total = len(labeled)
+    return {
+        "labeled_total": total,
+        "correct": correct,
+        "accuracy": correct / total if total > 0 else None,
+    }
+
+
+def normalize_tree_val_depths(
+    depths: Optional[List[int]],
+) -> List[int]:
+    raw_depths = (
+        depths
+        if depths is not None
+        else getattr(
+            config,
+            "TREE_VAL_MAX_DEPTH_CANDIDATES",
+            [2, 3, 4, 5],
+        )
+    )
+
+    normalized = []
+    for raw_depth in raw_depths:
+        depth = int(raw_depth)
+        if depth <= 0:
+            raise ValueError(
+                "Tree val 的候选 max_depth 必须全部大于 0，"
+                f"当前值: {raw_depth}"
+            )
+        if depth not in normalized:
+            normalized.append(depth)
+
+    if not normalized:
+        raise ValueError("Tree val 至少需要一个候选 max_depth")
+
+    return normalized
+
+
+def select_tree_model_by_validation(
+    train_cases: List[Dict[str, Any]],
+    validation_cases: List[Dict[str, Any]],
+    validation_indices: List[int],
+    selection: Dict[str, Any],
+    depth_candidates: Optional[List[int]] = None,
+):
+    candidates = normalize_tree_val_depths(depth_candidates)
+    best_model = None
+    best_feature_names = None
+    best_label_encoder = None
+    best_accuracy = -1.0
+    best_depth = None
+    scores = []
+
+    for depth in candidates:
+        clf, feature_names, label_encoder = train_tree_model(
+            train_cases,
+            selection,
+            max_depth=depth,
+        )
+        validation_results = predict_by_tree(
+            validation_cases,
+            validation_indices,
+            clf,
+            feature_names,
+            label_encoder,
+            selection,
+        )
+        score = summarize_tree_accuracy(validation_results)
+        accuracy = score["accuracy"]
+
+        if accuracy is None:
+            raise ValueError(
+                "启用 Tree val 时验证 case 必须包含非空 root_cause"
+            )
+
+        scores.append({
+            "max_depth": depth,
+            **score,
+        })
+        print(
+            f"[Tree val] max_depth={depth}: "
+            f"accuracy={accuracy:.4f} "
+            f"({score['correct']}/{score['labeled_total']})"
+        )
+
+        # Equal scores keep the first candidate, matching tree_val.py.
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_depth = depth
+            best_model = clf
+            best_feature_names = feature_names
+            best_label_encoder = label_encoder
+
+    print(
+        f"[Tree val] selected max_depth={best_depth}, "
+        f"accuracy={best_accuracy:.4f}"
+    )
+    validation = {
+        "enabled": True,
+        "source": "infer_cases",
+        "indices": list(validation_indices),
+        "depth_candidates": candidates,
+        "scores": scores,
+        "selected_max_depth": best_depth,
+        "selected_accuracy": best_accuracy,
+    }
+    return (
+        best_model,
+        best_feature_names,
+        best_label_encoder,
+        validation,
+    )
+
+
 def run_tree_once(
     scenario: Dict[str, Any],
     train_cases: List[Dict[str, Any]],
@@ -281,14 +411,41 @@ def run_tree_once(
     output_dir: str,
     output_format: str,
     tag: str,
+    enable_val: bool = False,
+    val_depths: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     scenario_name = scenario["name"]
     alarm_type = scenario["alarm_type"]
 
-    clf, feature_names, label_encoder = train_tree_model(
-        train_cases,
-        selection,
-    )
+    if enable_val:
+        (
+            clf,
+            feature_names,
+            label_encoder,
+            validation,
+        ) = select_tree_model_by_validation(
+            train_cases=train_cases,
+            validation_cases=infer_cases,
+            validation_indices=infer_indices,
+            selection=selection,
+            depth_candidates=val_depths,
+        )
+        selected_max_depth = validation["selected_max_depth"]
+    else:
+        clf, feature_names, label_encoder = train_tree_model(
+            train_cases,
+            selection,
+        )
+        selected_max_depth = getattr(config, "MAX_DEPTH", 3)
+        validation = {
+            "enabled": False,
+            "source": None,
+            "indices": [],
+            "depth_candidates": [],
+            "scores": [],
+            "selected_max_depth": selected_max_depth,
+            "selected_accuracy": None,
+        }
 
     tree_rule_path = save_tree_rules(
         clf,
@@ -308,16 +465,10 @@ def run_tree_once(
         selection,
     )
 
-    labeled = [
-        item for item in results
-        if item.get("is_correct") is not None
-    ]
-    correct = sum(
-        1 for item in labeled
-        if item.get("is_correct") is True
-    )
-    total = len(labeled)
-    accuracy = correct / total if total > 0 else None
+    accuracy_summary = summarize_tree_accuracy(results)
+    correct = accuracy_summary["correct"]
+    total = accuracy_summary["labeled_total"]
+    accuracy = accuracy_summary["accuracy"]
 
     payload = {
         "meta": {
@@ -329,7 +480,8 @@ def run_tree_once(
             "train_indices": train_indices,
             "infer_indices": infer_indices,
             "tree_rule_path": tree_rule_path,
-            "max_depth": getattr(config, "MAX_DEPTH", 3),
+            "max_depth": selected_max_depth,
+            "tree_val_enabled": enable_val,
             "min_samples_leaf": getattr(
                 config,
                 "MIN_SAMPLES_LEAF",
@@ -339,6 +491,7 @@ def run_tree_once(
             "output_dir": output_dir,
         },
         "selection": selection,
+        "validation": validation,
         "summary": {
             "labeled_total": total,
             "correct": correct,
@@ -364,6 +517,8 @@ def tree_infer_incremental_one_scenario(
     refiner_rounds: int,
     output_dir: Optional[str],
     output_format: str,
+    enable_val: bool = False,
+    val_depths: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     scenario_name = scenario["name"]
     alarm_type = scenario["alarm_type"]
@@ -399,6 +554,7 @@ def tree_infer_incremental_one_scenario(
     print(f"train_indices    : {train_indices}")
     print(f"infer_indices    : {infer_indices}")
     print(f"selection_source : {selection_source}")
+    print(f"tree_val_enabled : {enable_val}")
     print("=" * 100)
 
     reader = IndexedCaseReader(
@@ -456,6 +612,8 @@ def tree_infer_incremental_one_scenario(
                 output_dir=round_dir,
                 output_format="json",
                 tag=f"refiner_round_{round_id}",
+                enable_val=enable_val,
+                val_depths=val_depths,
             )
 
             tree_summary = build_tree_summary_for_refiner(tmp_payload)
@@ -496,6 +654,8 @@ def tree_infer_incremental_one_scenario(
         output_dir=final_output_dir,
         output_format=output_format,
         tag="final",
+        enable_val=enable_val,
+        val_depths=val_depths,
     )
 
     accuracy = payload.get("summary", {}).get("accuracy")
@@ -549,6 +709,8 @@ def tree_infer(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 refiner_rounds=args.refiner_rounds,
                 output_dir=args.output_dir,
                 output_format=args.output_format,
+                enable_val=getattr(args, "tree_val", False),
+                val_depths=getattr(args, "tree_val_depths", None),
             )
             payloads.append(payload)
 

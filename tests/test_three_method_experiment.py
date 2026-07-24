@@ -90,6 +90,21 @@ class ThreeMethodExperimentTests(unittest.TestCase):
             else:
                 os.environ["ASCEND_RT_VISIBLE_DEVICES"] = previous
 
+    def test_preserves_explicit_ascend_devices(self):
+        previous = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+        try:
+            os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1,2,3"
+            configure_runtime_environment()
+            self.assertEqual(
+                os.environ["ASCEND_RT_VISIBLE_DEVICES"],
+                "0,1,2,3",
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
+            else:
+                os.environ["ASCEND_RT_VISIBLE_DEVICES"] = previous
+
     def test_experiment_selects_only_indices_51_through_250(self):
         with tempfile.TemporaryDirectory() as root:
             scenario_name = "告警A"
