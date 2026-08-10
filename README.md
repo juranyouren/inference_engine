@@ -39,12 +39,6 @@ python infer_by_index.py --infer-type llm_infer
 # 只跑 Tree
 python infer_by_index.py --infer-type tree_infer
 
-# 只跑 Tree，并启用根因重排 val
-python infer_by_index.py --infer-type tree_infer \
-  --tree-val \
-  --tree-val-rule-root /home/sbp/huangzeshun/RCA_Units/rt2feature \
-  --tree-val-template-dir /home/sbp/huangzeshun/RCA_Units/template
-
 # 只处理一个类别
 python infer_by_index.py --scenario 网络设备掉线
 
@@ -85,8 +79,7 @@ python run_three_method_experiment.py \
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python run_three_method_experiment.py \
-  --methods tree \
-  --tree-val \
+  --methods tree --tree-val \
   --tree-val-rule-root /home/sbp/huangzeshun/RCA_Units/rt2feature \
   --tree-val-template-dir /home/sbp/huangzeshun/RCA_Units/template \
   --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/tree_val
@@ -183,3 +176,19 @@ python rerun_failed_llm_cases.py \
 `--rerun-text-fallback` 可同时重跑低置信度文本兜底结果。原始结果不会被覆盖：
 单独重跑结果位于 `rerun_failed/`，替换失败项后的完整结果和总体评分位于
 `reparsed_after_rerun/`。
+
+## LLM 已有结果重排
+
+不重新调用大模型，直接加载已有 `competition/predictions.json` 和 `cooperation/predictions.json`，映射 `groundtruth -> rc` 后调用共享 val 函数：
+
+```bash
+python rerank_llm_results.py \
+  --experiment-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods \
+  --methods competition cooperation \
+  --label-root /home/sbp/deployment/case_pool/AgentDigest_label \
+  --tree-val-rule-root /home/sbp/huangzeshun/RCA_Units/rt2feature \
+  --tree-val-template-dir /home/sbp/huangzeshun/RCA_Units/template \
+  --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods/llm_reranked
+```
+
+Tree 的 val 只在 `run_three_method_experiment.py` 中串联，`inference/tree.py` 保持纯 Tree 推理；输出同时保留原始 `pred_rc/rank` 和重排后的 `pred_rc_val/rank_val`。
