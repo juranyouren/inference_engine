@@ -181,6 +181,13 @@ def _normalize_tree_result(
     groundtruth = _root_cause_category(label_data)
     prediction = _deduplicate(item.get("pred_rc", []))
     rank = prediction.index(groundtruth) + 1 if groundtruth in prediction else None
+    prediction_val = _deduplicate(item.get("pred_rc_val", []))
+    val_present = "pred_rc_val" in item
+    rank_val = (
+        prediction_val.index(groundtruth) + 1
+        if groundtruth in prediction_val
+        else None
+    )
     normalized = dict(item)
     normalized.update({
         "scenario_name": scenario["name"],
@@ -189,6 +196,12 @@ def _normalize_tree_result(
         "pred_rc": prediction,
         "rank": rank,
         "is_correct": rank == 1,
+        "pred_top1_rc_val": (
+            prediction_val[0] if prediction_val else None
+        ),
+        "pred_rc_val": prediction_val,
+        "rank_val": rank_val,
+        "is_correct_val": rank_val == 1 if val_present else None,
         "tree_stage": stage,
         "train_indices": train_indices,
     })
@@ -304,8 +317,9 @@ def _run_tree(args: argparse.Namespace) -> None:
                     output_dir=interim_tree_dir,
                     output_format="json",
                     tag=f"before_refiner_round_{round_id}",
-                    enable_val=args.tree_val,
-                    val_depths=args.tree_val_depths,
+                    # Refiner summaries should use the raw Tree output;
+                    # apply val only to the final Tree result.
+                    enable_val=False,
                 )
                 tree_summary = build_tree_summary_for_refiner(interim_payload)
                 save_json(tree_summary, os.path.join(round_dir, "tree_summary.json"))
@@ -332,7 +346,10 @@ def _run_tree(args: argparse.Namespace) -> None:
                 output_format=args.output_format,
                 tag="final_after_refiner",
                 enable_val=args.tree_val,
-                val_depths=args.tree_val_depths,
+                val_rule_root=args.tree_val_rule_root,
+                val_template_dir=args.tree_val_template_dir,
+                val_kpi_mode=args.tree_val_kpi_mode,
+                val_neutral_score=args.tree_val_neutral_score,
             )
             tree_seconds = time.perf_counter() - tree_started
             elapsed = selector_seconds + refiner_seconds + tree_seconds
@@ -368,7 +385,10 @@ def _run_tree(args: argparse.Namespace) -> None:
             "selection_source": "selector_refiner",
             "refiner_rounds": args.refiner_rounds,
             "tree_val_enabled": args.tree_val,
-            "tree_val_depths": args.tree_val_depths,
+            "tree_val_rule_root": args.tree_val_rule_root,
+            "tree_val_template_dir": args.tree_val_template_dir,
+            "tree_val_kpi_mode": args.tree_val_kpi_mode,
+            "tree_val_neutral_score": args.tree_val_neutral_score,
             "test_mode": args.test,
             "runs": runs,
         },
@@ -510,9 +530,10 @@ def _method_worker(args: argparse.Namespace, method: str) -> None:
 def calculate_metrics(
     results: Sequence[Dict[str, Any]],
     elapsed_seconds: float,
+    rank_key: str = "rank",
 ) -> Dict[str, Any]:
     labeled = [item for item in results if item.get("groundtruth")]
-    ranks = [item.get("rank") for item in labeled]
+    ranks = [item.get(rank_key) for item in labeled]
     total = len(labeled)
 
     def top_k(k: int) -> Optional[float]:
@@ -546,6 +567,11 @@ def evaluate_saved_results(output_dir: str, methods: Sequence[str]) -> Dict[str,
         payload = load_json(prediction_file)
         results = payload.get("results", [])
         runs = payload.get("meta", {}).get("runs", [])
+        use_val = (
+            method == "tree"
+            and payload.get("meta", {}).get("tree_val_enabled") is True
+        )
+        rank_key = "rank_val" if use_val else "rank"
 
         scenario_names = sorted({item.get("scenario_name") for item in results})
         for scenario_name in scenario_names:
@@ -560,7 +586,11 @@ def evaluate_saved_results(output_dir: str, methods: Sequence[str]) -> Dict[str,
             rows.append({
                 "method": method,
                 "scope": scenario_name,
-                **calculate_metrics(scenario_results, elapsed),
+                **calculate_metrics(
+                    scenario_results,
+                    elapsed,
+                    rank_key=rank_key,
+                ),
             })
 
         rows.append({
@@ -569,6 +599,7 @@ def evaluate_saved_results(output_dir: str, methods: Sequence[str]) -> Dict[str,
             **calculate_metrics(
                 results,
                 sum(float(run.get("elapsed_seconds", 0.0)) for run in runs),
+                rank_key=rank_key,
             ),
         })
 
@@ -640,24 +671,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--tree-val",
         dest="tree_val",
         action="store_true",
-        help="Tree 在每个 infer block 上比较候选 max_depth 并选择验证准确率最高者。",
+        help="Tree 对候选根因列表按特征规则进行 val 重排。",
     )
     tree_val_group.add_argument(
         "--no-tree-val",
         dest="tree_val",
         action="store_false",
-        help="Tree 固定使用 config.MAX_DEPTH。",
+        help="Tree 关闭 val，保留原始根因排序。",
     )
     parser.set_defaults(
         tree_val=getattr(config, "TREE_VAL_ENABLED", False),
     )
     parser.add_argument(
-        "--tree-val-depths",
-        type=int,
-        nargs="+",
+        "--tree-val-rule-root",
         default=None,
-        metavar="DEPTH",
-        help="Tree val 候选深度；默认读取 config.TREE_VAL_MAX_DEPTH_CANDIDATES。",
+        help="Tree val 场景规则 JSON 所在目录；默认读取 config。",
+    )
+    parser.add_argument(
+        "--tree-val-template-dir",
+        default=None,
+        help="Tree val 用于补全候选根因的模板目录；默认读取 config。",
+    )
+    parser.add_argument(
+        "--tree-val-kpi-mode",
+        choices=["mix", "alarm"],
+        default=None,
+        help="Tree val KPI 特征模式；默认读取 config。",
+    )
+    parser.add_argument(
+        "--tree-val-neutral-score",
+        type=float,
+        default=None,
+        help="Tree val 在全部相关特征缺失时使用的中性分数。",
     )
     parser.add_argument("--batch-size", type=int, default=getattr(config, "BATCH_SIZE", 16))
     parser.add_argument(

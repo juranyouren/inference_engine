@@ -14,6 +14,7 @@ from inference.common import (
     discover_label_indices,
     ensure_dir,
     get_incremental_indices,
+    load_json,
     load_infer_state,
     save_infer_outputs,
     save_infer_state,
@@ -295,110 +296,155 @@ def summarize_tree_accuracy(
     }
 
 
-def normalize_tree_val_depths(
-    depths: Optional[List[int]],
-) -> List[int]:
-    raw_depths = (
-        depths
-        if depths is not None
-        else getattr(
-            config,
-            "TREE_VAL_MAX_DEPTH_CANDIDATES",
-            [2, 3, 4, 5],
+class _TreeValCaseDataLoader:
+    """Adapter for the val feature extractor used by the current Tree reader."""
+
+    def __init__(self, cases: List[Dict[str, Any]], indices: List[int]):
+        self._cases_by_index = dict(zip(indices, cases))
+
+    def get_cases_by_id_range(
+        self,
+        start_id: int,
+        end_id: int,
+    ) -> Tuple[List[Dict[str, Any]], List[int]]:
+        selected_indices = sorted(
+            idx for idx in self._cases_by_index
+            if start_id <= idx < end_id
         )
+        return (
+            [self._cases_by_index[idx] for idx in selected_indices],
+            selected_indices,
+        )
+
+
+def _load_tree_val_rule_config(
+    scenario: Dict[str, Any],
+    rule_root: str,
+) -> Tuple[str, Dict[str, Any], str]:
+    alarm_type = scenario["alarm_type"]
+    candidates = [
+        os.path.join(rule_root, f"{alarm_type}.json"),
+    ]
+    if scenario.get("name") != alarm_type:
+        candidates.append(
+            os.path.join(rule_root, f"{scenario['name']}.json")
+        )
+
+    for path in candidates:
+        if os.path.exists(path):
+            return alarm_type, load_json(path), path
+
+    raise FileNotFoundError(
+        f"未找到场景 {alarm_type} 的 Tree val 规则文件；"
+        f"已检查: {candidates}"
     )
 
-    normalized = []
-    for raw_depth in raw_depths:
-        depth = int(raw_depth)
-        if depth <= 0:
-            raise ValueError(
-                "Tree val 的候选 max_depth 必须全部大于 0，"
-                f"当前值: {raw_depth}"
-            )
-        if depth not in normalized:
-            normalized.append(depth)
 
-    if not normalized:
-        raise ValueError("Tree val 至少需要一个候选 max_depth")
-
-    return normalized
-
-
-def select_tree_model_by_validation(
-    train_cases: List[Dict[str, Any]],
-    validation_cases: List[Dict[str, Any]],
-    validation_indices: List[int],
-    selection: Dict[str, Any],
-    depth_candidates: Optional[List[int]] = None,
-):
-    candidates = normalize_tree_val_depths(depth_candidates)
-    best_model = None
-    best_feature_names = None
-    best_label_encoder = None
-    best_accuracy = -1.0
-    best_depth = None
-    scores = []
-
-    for depth in candidates:
-        clf, feature_names, label_encoder = train_tree_model(
-            train_cases,
-            selection,
-            max_depth=depth,
-        )
-        validation_results = predict_by_tree(
-            validation_cases,
-            validation_indices,
-            clf,
-            feature_names,
-            label_encoder,
-            selection,
-        )
-        score = summarize_tree_accuracy(validation_results)
-        accuracy = score["accuracy"]
-
-        if accuracy is None:
-            raise ValueError(
-                "启用 Tree val 时验证 case 必须包含非空 root_cause"
-            )
-
-        scores.append({
-            "max_depth": depth,
-            **score,
-        })
-        print(
-            f"[Tree val] max_depth={depth}: "
-            f"accuracy={accuracy:.4f} "
-            f"({score['correct']}/{score['labeled_total']})"
-        )
-
-        # Equal scores keep the first candidate, matching tree_val.py.
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            best_depth = depth
-            best_model = clf
-            best_feature_names = feature_names
-            best_label_encoder = label_encoder
-
-    print(
-        f"[Tree val] selected max_depth={best_depth}, "
-        f"accuracy={best_accuracy:.4f}"
+def _summarize_tree_val_results(
+    results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    labeled = [
+        item for item in results
+        if item.get("is_correct_val") is not None
+    ]
+    correct = sum(
+        1 for item in labeled
+        if item.get("is_correct_val") is True
     )
-    validation = {
-        "enabled": True,
-        "source": "infer_cases",
-        "indices": list(validation_indices),
-        "depth_candidates": candidates,
-        "scores": scores,
-        "selected_max_depth": best_depth,
-        "selected_accuracy": best_accuracy,
+    return {
+        "labeled_total": len(labeled),
+        "correct": correct,
+        "accuracy": correct / len(labeled) if labeled else None,
+        "rerank_skipped": sum(
+            1 for item in results
+            if item.get("rerank_skipped") is True
+        ),
+        "rerank_changed": sum(
+            1 for item in results
+            if item.get("rerank_changed") is True
+        ),
+        "pred_top1_changed": sum(
+            1 for item in results
+            if item.get("pred_top1_changed") is True
+        ),
     }
-    return (
-        best_model,
-        best_feature_names,
-        best_label_encoder,
-        validation,
+
+
+def _rerank_tree_results_with_val(
+    scenario: Dict[str, Any],
+    infer_cases: List[Dict[str, Any]],
+    infer_indices: List[int],
+    results: List[Dict[str, Any]],
+    rule_root: Optional[str] = None,
+    template_dir: Optional[str] = None,
+    kpi_mode: Optional[str] = None,
+    neutral_score: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    from rule_inferencer.data_process_val import (
+        rerank_root_cause_results,
     )
+
+    rule_root = rule_root or getattr(
+        config,
+        "TREE_VAL_RULE_ROOT",
+        "/home/sbp/huangzeshun/RCA_Units/rt2feature",
+    )
+    template_dir = template_dir or getattr(
+        config,
+        "TREE_VAL_TEMPLATE_DIR",
+        getattr(
+            config,
+            "TEMPLATE_DIR",
+            "/home/sbp/huangzeshun/RCA_Units/template",
+        ),
+    )
+    kpi_mode = kpi_mode or getattr(config, "TREE_VAL_KPI_MODE", "mix")
+    neutral_score = (
+        neutral_score
+        if neutral_score is not None
+        else getattr(config, "TREE_VAL_NEUTRAL_SCORE", 0.5)
+    )
+    target_size = getattr(config, "TREE_VAL_TARGET_SIZE", 5)
+    random_seed = getattr(config, "TREE_VAL_RANDOM_SEED", 42)
+    alarm_type, rule_config, rule_path = _load_tree_val_rule_config(
+        scenario,
+        rule_root,
+    )
+
+    for result in results:
+        # val uses `rc`; retain the current `groundtruth` field as-is too.
+        result["rc"] = result.get("groundtruth")
+
+    ret = rerank_root_cause_results(
+        ret={"results": results},
+        dataloader=_TreeValCaseDataLoader(infer_cases, infer_indices),
+        rule_configs={alarm_type: rule_config},
+        kpi_mode=kpi_mode,
+        neutral_score=neutral_score,
+        template_dir=template_dir,
+        target_size=target_size,
+        seed=random_seed,
+    )
+    reranked_results = ret.get("results", [])
+    for result in reranked_results:
+        groundtruth = result.get("rc")
+        pred_rc_val = result.get("pred_rc_val", [])
+        result["rank_val"] = (
+            pred_rc_val.index(groundtruth) + 1
+            if groundtruth in pred_rc_val
+            else None
+        )
+    return reranked_results, {
+        "enabled": True,
+        "rule_path": rule_path,
+        "template_dir": template_dir,
+        "kpi_mode": kpi_mode,
+        "neutral_score": neutral_score,
+        "target_size": target_size,
+        "random_seed": random_seed,
+        "indices": list(infer_indices),
+        "summary": _summarize_tree_val_results(reranked_results),
+    }
 
 
 def run_tree_once(
@@ -412,40 +458,18 @@ def run_tree_once(
     output_format: str,
     tag: str,
     enable_val: bool = False,
-    val_depths: Optional[List[int]] = None,
+    val_rule_root: Optional[str] = None,
+    val_template_dir: Optional[str] = None,
+    val_kpi_mode: Optional[str] = None,
+    val_neutral_score: Optional[float] = None,
 ) -> Dict[str, Any]:
     scenario_name = scenario["name"]
     alarm_type = scenario["alarm_type"]
 
-    if enable_val:
-        (
-            clf,
-            feature_names,
-            label_encoder,
-            validation,
-        ) = select_tree_model_by_validation(
-            train_cases=train_cases,
-            validation_cases=infer_cases,
-            validation_indices=infer_indices,
-            selection=selection,
-            depth_candidates=val_depths,
-        )
-        selected_max_depth = validation["selected_max_depth"]
-    else:
-        clf, feature_names, label_encoder = train_tree_model(
-            train_cases,
-            selection,
-        )
-        selected_max_depth = getattr(config, "MAX_DEPTH", 3)
-        validation = {
-            "enabled": False,
-            "source": None,
-            "indices": [],
-            "depth_candidates": [],
-            "scores": [],
-            "selected_max_depth": selected_max_depth,
-            "selected_accuracy": None,
-        }
+    clf, feature_names, label_encoder = train_tree_model(
+        train_cases,
+        selection,
+    )
 
     tree_rule_path = save_tree_rules(
         clf,
@@ -465,6 +489,23 @@ def run_tree_once(
         selection,
     )
 
+    validation = {
+        "enabled": False,
+        "type": "root_cause_rerank",
+        "indices": [],
+    }
+    if enable_val:
+        results, validation = _rerank_tree_results_with_val(
+            scenario=scenario,
+            infer_cases=infer_cases,
+            infer_indices=infer_indices,
+            results=results,
+            rule_root=val_rule_root,
+            template_dir=val_template_dir,
+            kpi_mode=val_kpi_mode,
+            neutral_score=val_neutral_score,
+        )
+
     accuracy_summary = summarize_tree_accuracy(results)
     correct = accuracy_summary["correct"]
     total = accuracy_summary["labeled_total"]
@@ -480,7 +521,7 @@ def run_tree_once(
             "train_indices": train_indices,
             "infer_indices": infer_indices,
             "tree_rule_path": tree_rule_path,
-            "max_depth": selected_max_depth,
+            "max_depth": getattr(config, "MAX_DEPTH", 3),
             "tree_val_enabled": enable_val,
             "min_samples_leaf": getattr(
                 config,
@@ -518,7 +559,10 @@ def tree_infer_incremental_one_scenario(
     output_dir: Optional[str],
     output_format: str,
     enable_val: bool = False,
-    val_depths: Optional[List[int]] = None,
+    val_rule_root: Optional[str] = None,
+    val_template_dir: Optional[str] = None,
+    val_kpi_mode: Optional[str] = None,
+    val_neutral_score: Optional[float] = None,
 ) -> Dict[str, Any]:
     scenario_name = scenario["name"]
     alarm_type = scenario["alarm_type"]
@@ -612,8 +656,9 @@ def tree_infer_incremental_one_scenario(
                 output_dir=round_dir,
                 output_format="json",
                 tag=f"refiner_round_{round_id}",
-                enable_val=enable_val,
-                val_depths=val_depths,
+                # Refiner summaries should describe the raw Tree output;
+                # apply root-cause val only to the final Tree result.
+                enable_val=False,
             )
 
             tree_summary = build_tree_summary_for_refiner(tmp_payload)
@@ -655,7 +700,10 @@ def tree_infer_incremental_one_scenario(
         output_format=output_format,
         tag="final",
         enable_val=enable_val,
-        val_depths=val_depths,
+        val_rule_root=val_rule_root,
+        val_template_dir=val_template_dir,
+        val_kpi_mode=val_kpi_mode,
+        val_neutral_score=val_neutral_score,
     )
 
     accuracy = payload.get("summary", {}).get("accuracy")
@@ -710,7 +758,10 @@ def tree_infer(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 output_dir=args.output_dir,
                 output_format=args.output_format,
                 enable_val=getattr(args, "tree_val", False),
-                val_depths=getattr(args, "tree_val_depths", None),
+                val_rule_root=getattr(args, "tree_val_rule_root", None),
+                val_template_dir=getattr(args, "tree_val_template_dir", None),
+                val_kpi_mode=getattr(args, "tree_val_kpi_mode", None),
+                val_neutral_score=getattr(args, "tree_val_neutral_score", None),
             )
             payloads.append(payload)
 

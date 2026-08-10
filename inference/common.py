@@ -139,12 +139,27 @@ def save_infer_outputs(
                     item.get("pred_rc", []),
                     ensure_ascii=False,
                 ),
+                "pred_top1_rc_val": item.get("pred_top1_rc_val"),
+                "pred_rc_val": json.dumps(
+                    item.get("pred_rc_val", []),
+                    ensure_ascii=False,
+                ),
+                "pred_rc_val_check": json.dumps(
+                    item.get("pred_rc_val_check", []),
+                    ensure_ascii=False,
+                    default=str,
+                ),
                 "cot": json.dumps(
                     item.get("cot", {}),
                     ensure_ascii=False,
                 ),
                 "rank": item.get("rank"),
+                "rank_val": item.get("rank_val"),
                 "is_correct": item.get("is_correct"),
+                "is_correct_val": item.get("is_correct_val"),
+                "rerank_skipped": item.get("rerank_skipped"),
+                "rerank_changed": item.get("rerank_changed"),
+                "pred_top1_changed": item.get("pred_top1_changed"),
             })
         save_csv(rows, os.path.join(output_dir, "predictions.csv"))
 

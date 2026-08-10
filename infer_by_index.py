@@ -140,31 +140,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--tree-val",
         dest="tree_val",
         action="store_true",
-        help=(
-            "启用 Tree 验证选深度：在当前 infer 窗口上比较候选 "
-            "max_depth，并使用准确率最高的树。"
-        ),
+        help="启用 Tree val：按特征规则对候选根因列表进行重排。",
     )
     tree_val_group.add_argument(
         "--no-tree-val",
         dest="tree_val",
         action="store_false",
-        help="关闭 Tree 验证选深度，固定使用 config.MAX_DEPTH。",
+        help="关闭 Tree val，保留 Tree 原始根因排序。",
     )
     parser.set_defaults(
         tree_val=getattr(config, "TREE_VAL_ENABLED", False),
     )
 
     parser.add_argument(
-        "--tree-val-depths",
-        type=int,
-        nargs="+",
+        "--tree-val-rule-root",
         default=None,
-        metavar="DEPTH",
-        help=(
-            "Tree val 的候选 max_depth；默认使用 "
-            "config.TREE_VAL_MAX_DEPTH_CANDIDATES。"
-        ),
+        help="Tree val 场景规则 JSON 所在目录；默认读取 config。",
+    )
+    parser.add_argument(
+        "--tree-val-template-dir",
+        default=None,
+        help="Tree val 用于补全候选根因的模板目录；默认读取 config。",
+    )
+    parser.add_argument(
+        "--tree-val-kpi-mode",
+        choices=["mix", "alarm"],
+        default=None,
+        help="Tree val KPI 特征模式；默认读取 config。",
+    )
+    parser.add_argument(
+        "--tree-val-neutral-score",
+        type=float,
+        default=None,
+        help="Tree val 在全部相关特征缺失时使用的中性分数。",
     )
 
     parser.add_argument(
