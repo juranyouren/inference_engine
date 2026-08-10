@@ -192,3 +192,5 @@ python rerank_llm_results.py \
 ```
 
 Tree 的 val 只在 `run_three_method_experiment.py` 中串联，`inference/tree.py` 保持纯 Tree 推理；输出同时保留原始 `pred_rc/rank` 和重排后的 `pred_rc_val/rank_val`。
+
+重排脚本会生成 `evaluation/metrics.json` 和 `evaluation/metrics.csv`，分别给出 raw/val 的 Top-1、Top-3、Top-5、MRR、总耗时和平均每 case 耗时；val 行还会单独记录 `rerank_elapsed_seconds`。
