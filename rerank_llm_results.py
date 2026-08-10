@@ -17,6 +17,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 import argparse
 import copy
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -29,6 +30,7 @@ from inference.common import (  # noqa: E402
     IndexedCaseReader,
     ensure_dir,
     load_json,
+    save_csv,
     save_infer_outputs,
     save_json,
 )
@@ -104,6 +106,119 @@ def _normalize_result(
     return normalized
 
 
+def _calculate_metrics(
+    results: Sequence[Dict[str, Any]],
+    elapsed_seconds: float,
+    rank_key: str,
+) -> Dict[str, Any]:
+    labeled = [item for item in results if item.get("groundtruth")]
+    ranks = [item.get(rank_key) for item in labeled]
+    total = len(labeled)
+
+    def top_k(k: int) -> Optional[float]:
+        if not total:
+            return None
+        return sum(
+            rank is not None and rank <= k
+            for rank in ranks
+        ) / total
+
+    return {
+        "evaluated_count": total,
+        "top1": top_k(1),
+        "top3": top_k(3),
+        "top5": top_k(5),
+        "mrr": (
+            sum(1.0 / rank if rank else 0.0 for rank in ranks) / total
+            if total else None
+        ),
+        "elapsed_seconds": elapsed_seconds,
+        "average_seconds_per_case": (
+            elapsed_seconds / total if total else None
+        ),
+        "unparsed_count": sum(
+            item.get("parse_strategy") == "unparsed"
+            for item in labeled
+        ),
+    }
+
+
+def _source_elapsed_seconds(
+    source_payload: Dict[str, Any],
+    scenario_name: Optional[str] = None,
+) -> float:
+    runs = source_payload.get("meta", {}).get("runs", [])
+    if isinstance(runs, list):
+        return sum(
+            float(run.get("elapsed_seconds", 0.0))
+            for run in runs
+            if scenario_name is None
+            or run.get("scenario_name") == scenario_name
+        )
+    return float(source_payload.get("meta", {}).get("elapsed_seconds", 0.0))
+
+
+def _build_evaluation_report(
+    method: str,
+    results: Sequence[Dict[str, Any]],
+    scenario_names: Sequence[str],
+    source_payload: Dict[str, Any],
+    rerank_elapsed_by_scenario: Dict[str, float],
+) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+
+    def append_rows(scope: str, scoped_results: Sequence[Dict[str, Any]]) -> None:
+        model_elapsed = _source_elapsed_seconds(
+            source_payload,
+            None if scope == "overall" else scope,
+        )
+        rerank_elapsed = sum(
+            rerank_elapsed_by_scenario.values()
+        ) if scope == "overall" else rerank_elapsed_by_scenario.get(scope, 0.0)
+
+        for ranking, rank_key, elapsed in (
+            ("raw", "rank", model_elapsed),
+            ("val", "rank_val", model_elapsed + rerank_elapsed),
+        ):
+            metrics = _calculate_metrics(
+                scoped_results,
+                elapsed_seconds=elapsed,
+                rank_key=rank_key,
+            )
+            rows.append({
+                "method": method,
+                "scope": scope,
+                "ranking": ranking,
+                "model_elapsed_seconds": model_elapsed,
+                "rerank_elapsed_seconds": rerank_elapsed,
+                "end_to_end_elapsed_seconds": elapsed,
+                **metrics,
+            })
+
+    for scenario_name in scenario_names:
+        append_rows(
+            scenario_name,
+            [
+                item for item in results
+                if item.get("scenario_name") == scenario_name
+            ],
+        )
+    append_rows("overall", results)
+
+    return {
+        "metric_definition": {
+            "raw": "LLM 原始候选列表，使用 rank",
+            "val": "规则重排后的候选列表，使用 rank_val",
+            "top_k": "truth rank <= k 的比例",
+            "mrr": "truth rank 倒数的平均值，未命中按 0 计",
+            "model_time": "已有结果中的 LLM 运行耗时",
+            "rerank_time": "本次 val 重排耗时",
+            "average_time": "end_to_end_elapsed_seconds / evaluated_count",
+        },
+        "metrics": rows,
+    }
+
+
 def _load_label_root(experiment_dir: str, explicit_root: Optional[str]) -> str:
     if explicit_root:
         return explicit_root
@@ -156,6 +271,7 @@ def rerank_method(
 
     merged_results: List[Dict[str, Any]] = []
     validations: List[Dict[str, Any]] = []
+    rerank_elapsed_by_scenario: Dict[str, float] = {}
     for scenario_name in sorted(grouped):
         raw_items = grouped[scenario_name]
         scenario = _scenario_for_results(scenario_name, raw_items, label_root)
@@ -166,6 +282,7 @@ def rerank_method(
         indices = [int(item["case_idx"]) for item in normalized]
         reader = IndexedCaseReader(scenario["data_dir"], scenario["alarm_type"])
         cases = reader.load_cases(indices)
+        rerank_started = time.perf_counter()
         reranked, validation = rerank_results_with_val(
             scenario=scenario,
             cases=cases,
@@ -178,6 +295,9 @@ def rerank_method(
             target_size=target_size,
             random_seed=random_seed,
         )
+        rerank_elapsed = time.perf_counter() - rerank_started
+        rerank_elapsed_by_scenario[scenario_name] = rerank_elapsed
+        validation["rerank_elapsed_seconds"] = rerank_elapsed
         merged_results.extend(reranked)
         validation["scenario_name"] = scenario_name
         validations.append(validation)
@@ -198,11 +318,19 @@ def rerank_method(
         "random_seed": random_seed,
         "validation_by_scenario": validations,
     })
+    evaluation = _build_evaluation_report(
+        method=method,
+        results=merged_results,
+        scenario_names=sorted(grouped),
+        source_payload=source_payload,
+        rerank_elapsed_by_scenario=rerank_elapsed_by_scenario,
+    )
     payload["summary"] = {
         "processed_count": len(merged_results),
         "processed_indices": [item.get("case_idx") for item in merged_results],
     }
     payload["results"] = merged_results
+    payload["evaluation"] = evaluation
 
     method_output_dir = os.path.join(output_dir, method)
     ensure_dir(method_output_dir)
@@ -212,9 +340,14 @@ def rerank_method(
             "source": source_path,
             "method": method,
             "validation_by_scenario": validations,
+            "evaluation": evaluation,
         },
         os.path.join(method_output_dir, "validation.json"),
     )
+    evaluation_dir = os.path.join(output_dir, "evaluation")
+    ensure_dir(evaluation_dir)
+    save_json(evaluation, os.path.join(evaluation_dir, f"{method}_metrics.json"))
+    save_csv(evaluation["metrics"], os.path.join(evaluation_dir, f"{method}_metrics.csv"))
     return payload
 
 
@@ -258,8 +391,9 @@ def main() -> None:
     label_root = _load_label_root(experiment_dir, args.label_root)
     ensure_dir(output_dir)
 
+    reports: List[Dict[str, Any]] = []
     for method in args.methods:
-        rerank_method(
+        payload = rerank_method(
             experiment_dir=experiment_dir,
             method=method,
             output_dir=output_dir,
@@ -272,7 +406,24 @@ def main() -> None:
             target_size=args.tree_val_target_size,
             random_seed=args.tree_val_random_seed,
         )
+        reports.extend(payload.get("evaluation", {}).get("metrics", []))
         print(f"[Done] {method}: {os.path.join(output_dir, method)}")
+
+    combined_report = {
+        "metric_definition": {
+            "raw": "LLM 原始候选列表，使用 rank",
+            "val": "规则重排后的候选列表，使用 rank_val",
+            "top_k": "truth rank <= k 的比例",
+            "mrr": "truth rank 倒数的平均值，未命中按 0 计",
+            "average_time": "end_to_end_elapsed_seconds / evaluated_count",
+        },
+        "metrics": reports,
+    }
+    evaluation_dir = os.path.join(output_dir, "evaluation")
+    ensure_dir(evaluation_dir)
+    save_json(combined_report, os.path.join(evaluation_dir, "metrics.json"))
+    save_csv(reports, os.path.join(evaluation_dir, "metrics.csv"))
+    print(json.dumps(combined_report, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from rerank_llm_results import (
+    _build_evaluation_report,
     _normalize_result,
     build_arg_parser as build_llm_rerank_parser,
 )
@@ -189,6 +190,52 @@ class TreeValidationTests(unittest.TestCase):
         self.assertEqual(item["rc"], "rc-b")
         self.assertEqual(item["pred_rc"], ["rc-a", "rc-b"])
         self.assertEqual(item["rank"], 2)
+
+    def test_evaluation_report_contains_topk_mrr_and_time(self):
+        results = [
+            {
+                "scenario_name": "scenario",
+                "groundtruth": "rc",
+                "rank": 1,
+                "rank_val": 2,
+            },
+            {
+                "scenario_name": "scenario",
+                "groundtruth": "rc",
+                "rank": 2,
+                "rank_val": 1,
+            },
+            {
+                "scenario_name": "scenario",
+                "groundtruth": "rc",
+                "rank": 6,
+                "rank_val": 3,
+            },
+        ]
+        report = _build_evaluation_report(
+            method="competition",
+            results=results,
+            scenario_names=["scenario"],
+            source_payload={
+                "meta": {
+                    "runs": [{
+                        "scenario_name": "scenario",
+                        "elapsed_seconds": 9.0,
+                    }],
+                },
+            },
+            rerank_elapsed_by_scenario={"scenario": 3.0},
+        )
+        val_row = next(
+            row for row in report["metrics"]
+            if row["scope"] == "scenario" and row["ranking"] == "val"
+        )
+        self.assertEqual(val_row["top1"], 1 / 3)
+        self.assertEqual(val_row["top3"], 1.0)
+        self.assertEqual(val_row["top5"], 1.0)
+        self.assertEqual(val_row["mrr"], (0.5 + 1.0 + 1 / 3) / 3)
+        self.assertEqual(val_row["elapsed_seconds"], 12.0)
+        self.assertEqual(val_row["average_seconds_per_case"], 4.0)
 
 
 if __name__ == "__main__":
