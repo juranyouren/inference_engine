@@ -253,6 +253,7 @@ def _run_tree(args: argparse.Namespace) -> None:
         refine_selection_by_tree_summary,
     )
     from inference.tree import run_tree_once
+    from inference.validation import rerank_results_with_val
 
     scenarios = _validate_scenarios(
         args.anomalydetect_label_root,
@@ -317,9 +318,6 @@ def _run_tree(args: argparse.Namespace) -> None:
                     output_dir=interim_tree_dir,
                     output_format="json",
                     tag=f"before_refiner_round_{round_id}",
-                    # Refiner summaries should use the raw Tree output;
-                    # apply val only to the final Tree result.
-                    enable_val=False,
                 )
                 tree_summary = build_tree_summary_for_refiner(interim_payload)
                 save_json(tree_summary, os.path.join(round_dir, "tree_summary.json"))
@@ -345,12 +343,30 @@ def _run_tree(args: argparse.Namespace) -> None:
                 output_dir=final_tree_dir,
                 output_format=args.output_format,
                 tag="final_after_refiner",
-                enable_val=args.tree_val,
-                val_rule_root=args.tree_val_rule_root,
-                val_template_dir=args.tree_val_template_dir,
-                val_kpi_mode=args.tree_val_kpi_mode,
-                val_neutral_score=args.tree_val_neutral_score,
             )
+            if args.tree_val:
+                reranked_results, validation = rerank_results_with_val(
+                    scenario=scenario,
+                    cases=infer_cases,
+                    indices=infer_indices,
+                    results=payload.get("results", []),
+                    rule_root=args.tree_val_rule_root,
+                    template_dir=args.tree_val_template_dir,
+                    kpi_mode=args.tree_val_kpi_mode,
+                    neutral_score=args.tree_val_neutral_score,
+                )
+                payload["results"] = reranked_results
+                payload["validation"] = validation
+            else:
+                payload["validation"] = {
+                    "enabled": False,
+                    "type": "root_cause_rerank",
+                    "indices": [],
+                }
+            payload.setdefault("meta", {})["tree_val_enabled"] = args.tree_val
+            # run_tree_once writes the raw payload; write it again after the
+            # optional chained rerank so the stage artifact is self-contained.
+            save_infer_outputs(payload, final_tree_dir, args.output_format)
             tree_seconds = time.perf_counter() - tree_started
             elapsed = selector_seconds + refiner_seconds + tree_seconds
             results = [

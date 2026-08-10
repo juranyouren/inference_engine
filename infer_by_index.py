@@ -32,9 +32,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 if hasattr(config, "ASCEND_RT_VISIBLE_DEVICES"):
-    os.environ.setdefault(
-        "ASCEND_RT_VISIBLE_DEVICES",
-        str(config.ASCEND_RT_VISIBLE_DEVICES),
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(
+        config.ASCEND_RT_VISIBLE_DEVICES
     )
 
 from inference.llm import llm_infer  # noqa: E402
@@ -133,46 +132,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Tree 使用当前新增数据之前最近多少条样本训练。",
-    )
-
-    tree_val_group = parser.add_mutually_exclusive_group()
-    tree_val_group.add_argument(
-        "--tree-val",
-        dest="tree_val",
-        action="store_true",
-        help="启用 Tree val：按特征规则对候选根因列表进行重排。",
-    )
-    tree_val_group.add_argument(
-        "--no-tree-val",
-        dest="tree_val",
-        action="store_false",
-        help="关闭 Tree val，保留 Tree 原始根因排序。",
-    )
-    parser.set_defaults(
-        tree_val=getattr(config, "TREE_VAL_ENABLED", False),
-    )
-
-    parser.add_argument(
-        "--tree-val-rule-root",
-        default=None,
-        help="Tree val 场景规则 JSON 所在目录；默认读取 config。",
-    )
-    parser.add_argument(
-        "--tree-val-template-dir",
-        default=None,
-        help="Tree val 用于补全候选根因的模板目录；默认读取 config。",
-    )
-    parser.add_argument(
-        "--tree-val-kpi-mode",
-        choices=["mix", "alarm"],
-        default=None,
-        help="Tree val KPI 特征模式；默认读取 config。",
-    )
-    parser.add_argument(
-        "--tree-val-neutral-score",
-        type=float,
-        default=None,
-        help="Tree val 在全部相关特征缺失时使用的中性分数。",
     )
 
     parser.add_argument(
