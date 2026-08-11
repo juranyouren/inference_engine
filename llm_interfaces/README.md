@@ -54,3 +54,22 @@ results = engine.infer(label_list, "/path/to/output")
 
 每个 case 的 prompt、原始响应和 `result.json` 会保存到
 `output/case_XXXXXX/`；整个批次的汇总保存在 `output/results.json`。
+
+## 两个接口各测试一个 case
+
+下面的入口会读取两个 JSON 文件，并分别以 `[json_dict]` 调用两个接口。两个模式
+使用串行的 spawn 子进程：Competition 进程完全退出后才启动 Cooperation，避免
+两个模型同时驻留在 NPU 内存中。
+
+```bash
+python -m llm_interfaces.main \
+  --model-path /path/to/model \
+  --competition-json /path/to/competition_label.json \
+  --cooperation-json /path/to/cooperation_label.json \
+  --competition-alarm-type BGP邻接状态改变 \
+  --cooperation-alarm-type BGP邻接状态改变 \
+  --output-dir /path/to/test_output
+```
+
+如果 JSON 本身包含 `alarm_type`，对应的 `--*-alarm-type` 参数可以省略。也可以用
+`--mode competition` 或 `--mode cooperation` 单独测试一种接口。
