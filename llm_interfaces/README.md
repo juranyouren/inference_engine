@@ -58,8 +58,8 @@ results = engine.infer(label_list, "/path/to/output")
 ## 两个接口各测试一个 case
 
 下面的入口会读取两个 JSON 文件，并分别以 `[json_dict]` 调用两个接口。两个模式
-使用串行的 spawn 子进程：Competition 进程完全退出后才启动 Cooperation，避免
-两个模型同时驻留在 NPU 内存中。
+直接在 main 进程中串行执行，不创建子进程：先初始化 Competition 类并调用
+`infer()`，完成后再初始化 Cooperation 类并调用 `infer()`。
 
 ```bash
 python -m llm_interfaces.main \
@@ -68,8 +68,18 @@ python -m llm_interfaces.main \
   --cooperation-json /path/to/cooperation_label.json \
   --competition-alarm-type BGP邻接状态改变 \
   --cooperation-alarm-type BGP邻接状态改变 \
+  --ascend-devices 0,1 \
   --output-dir /path/to/test_output
 ```
 
 如果 JSON 本身包含 `alarm_type`，对应的 `--*-alarm-type` 参数可以省略。也可以用
 `--mode competition` 或 `--mode cooperation` 单独测试一种接口。
+
+`--ascend-devices 0,1` 会在模型初始化前设置
+`ASCEND_RT_VISIBLE_DEVICES=0,1`，并自动使用 `tensor_parallel_size=2`。指定四张卡时可传
+`--ascend-devices 0,1,2,3`，张量并行度会自动设为 4。通常不需要再传
+`--tensor-parallel-size`；如果显式传入，其数值必须与卡号数量一致。
+
+注意：两个类虽然按顺序初始化，但 vLLM/Ascend 运行时在同一个进程中不保证第一个
+模型的显存能够完全释放。如果模型无法同时容纳或第二次初始化失败，应分别使用
+`--mode competition` 和 `--mode cooperation` 启动两次 main。

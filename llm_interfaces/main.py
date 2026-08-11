@@ -7,20 +7,19 @@
         --cooperation-json /path/to/cooperation_label.json \
         --output-dir /path/to/output
 
-两个模式在两个串行 spawn 子进程中执行。前一个进程完全退出并释放模型后，
-才会启动后一个进程，因此不会同时加载两个模型。
+两个模式直接在当前 main 进程中串行执行，不创建子进程。
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
-import multiprocessing as mp
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# 必须在子进程导入可能初始化 vLLM/torch_npu 的模块之前设置。
+# 必须在导入可能初始化 vLLM/torch_npu 的模块之前设置。
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
@@ -37,6 +36,42 @@ def load_json_case(path: str | Path) -> Dict[str, Any]:
             f"实际为 {type(data).__name__}"
         )
     return data
+
+
+def configure_ascend_devices(args: argparse.Namespace) -> None:
+    """在模型初始化前配置可见 NPU，并自动确定张量并行卡数。"""
+    raw_devices = args.ascend_devices
+    if raw_devices is None:
+        raw_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if raw_devices is None or not raw_devices.strip():
+        return
+
+    device_ids = [item.strip() for item in raw_devices.split(",")]
+    if any(not item or not item.isdigit() for item in device_ids):
+        raise ValueError(
+            "--ascend-devices 格式错误，请使用英文逗号分隔的卡号，"
+            "例如 0,1 或 2,3,4,5"
+        )
+    if len(set(device_ids)) != len(device_ids):
+        raise ValueError("--ascend-devices 不能包含重复卡号")
+
+    normalized = ",".join(device_ids)
+    visible_count = len(device_ids)
+
+    if args.tensor_parallel_size is None:
+        args.tensor_parallel_size = visible_count
+    elif args.tensor_parallel_size != visible_count:
+        raise ValueError(
+            "--tensor-parallel-size 必须等于可见 NPU 数量: "
+            f"visible={visible_count}, tensor_parallel_size="
+            f"{args.tensor_parallel_size}"
+        )
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = normalized
+    print(
+        "Ascend NPU 配置: "
+        f"ASCEND_RT_VISIBLE_DEVICES={normalized}, "
+        f"tensor_parallel_size={args.tensor_parallel_size}"
+    )
 
 
 def _infer_one_case(
@@ -88,6 +123,9 @@ def _infer_one_case(
         f"[{mode}] 推理成功，case_id={results[0].get('case_id')}，"
         f"结果目录={results[0].get('output_dir')}"
     )
+    # 当前模式结束后删除 Python 侧引用，再初始化下一个类。
+    del engine
+    gc.collect()
 
 
 def selected_jobs(args: argparse.Namespace) -> List[ModeJob]:
@@ -115,49 +153,38 @@ def selected_jobs(args: argparse.Namespace) -> List[ModeJob]:
     return jobs
 
 
-def run(args: argparse.Namespace, process_context=None) -> None:
+def run(args: argparse.Namespace) -> None:
+    configure_ascend_devices(args)
     jobs = selected_jobs(args)
-    context = process_context or mp.get_context("spawn")
     output_root = Path(args.output_dir).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
     for mode, json_path, alarm_type in jobs:
-        # 父进程只读取一个 JSON 对象；子进程接收 [dict] 调用接口。
         label = load_json_case(json_path)
         mode_output_dir = str(output_root / mode)
-        process = context.Process(
-            target=_infer_one_case,
-            kwargs={
-                "mode": mode,
-                "model_path": args.model_path,
-                "label": label,
-                "alarm_type": alarm_type,
-                "output_dir": mode_output_dir,
-                "batch_size": args.batch_size,
-                "max_rounds": args.max_rounds,
-                "tensor_parallel_size": args.tensor_parallel_size,
-                "gpu_memory_utilization": args.gpu_memory_utilization,
-                "max_model_len": args.max_model_len,
-                "max_tokens": args.max_tokens,
-                "prompt_safety_tokens": args.prompt_safety_tokens,
-            },
-            name=f"{mode}_one_case",
+        print(f"开始 {mode} 单 case 测试: {json_path}")
+        _infer_one_case(
+            mode=mode,
+            model_path=args.model_path,
+            label=label,
+            alarm_type=alarm_type,
+            output_dir=mode_output_dir,
+            batch_size=args.batch_size,
+            max_rounds=args.max_rounds,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            max_tokens=args.max_tokens,
+            prompt_safety_tokens=args.prompt_safety_tokens,
         )
-        print(f"启动 {mode} 单 case 测试: {json_path}")
-        process.start()
-        process.join()
-        if process.exitcode != 0:
-            raise RuntimeError(
-                f"{mode} 子进程失败，exitcode={process.exitcode}"
-            )
-        print(f"{mode} 子进程已退出，模型内存可由进程完整释放。")
+        print(f"{mode} 单 case 测试完成。")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "测试 Competition/Cooperation 接口，各推理一个 JSON case；"
-            "两个模式串行运行，不同时加载模型。"
+            "两个模式在当前 main 进程中直接串行运行。"
         )
     )
     parser.add_argument(
@@ -171,6 +198,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--competition-alarm-type")
     parser.add_argument("--cooperation-alarm-type")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--ascend-devices",
+        help=(
+            "当前 main 进程可见的 Ascend NPU 卡号，例如 0 或 0,1；"
+            "未设置时沿用环境变量 ASCEND_RT_VISIBLE_DEVICES。"
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--tensor-parallel-size", type=int, default=None)
@@ -191,5 +225,4 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     main()

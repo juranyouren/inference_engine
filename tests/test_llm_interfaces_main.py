@@ -1,10 +1,17 @@
 import argparse
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from llm_interfaces.main import load_json_case, run, selected_jobs
+from llm_interfaces.main import (
+    configure_ascend_devices,
+    load_json_case,
+    run,
+    selected_jobs,
+)
 
 
 def make_args(root, **overrides):
@@ -16,6 +23,7 @@ def make_args(root, **overrides):
         "competition_alarm_type": "competition-alarm",
         "cooperation_alarm_type": "cooperation-alarm",
         "output_dir": str(Path(root) / "output"),
+        "ascend_devices": None,
         "batch_size": 1,
         "max_rounds": 2,
         "tensor_parallel_size": None,
@@ -26,38 +34,6 @@ def make_args(root, **overrides):
     }
     values.update(overrides)
     return argparse.Namespace(**values)
-
-
-class FakeProcess:
-    def __init__(self, events, *, name, target, kwargs):
-        self.events = events
-        self.name = name
-        self.target = target
-        self.kwargs = kwargs
-        self.exitcode = None
-
-    def start(self):
-        self.events.append(f"start:{self.name}")
-        self.exitcode = 0
-
-    def join(self):
-        self.events.append(f"join:{self.name}")
-
-
-class FakeContext:
-    def __init__(self):
-        self.events = []
-        self.processes = []
-
-    def Process(self, *, name, target, kwargs):
-        process = FakeProcess(
-            self.events,
-            name=name,
-            target=target,
-            kwargs=kwargs,
-        )
-        self.processes.append(process)
-        return process
 
 
 class LlmInterfacesMainTests(unittest.TestCase):
@@ -74,30 +50,47 @@ class LlmInterfacesMainTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 selected_jobs(args)
 
-    def test_two_modes_are_started_and_joined_serially(self):
+    def test_device_list_sets_environment_and_parallel_size(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = make_args(root, ascend_devices="2,3", tensor_parallel_size=None)
+            with patch.dict(os.environ, {}, clear=False):
+                configure_ascend_devices(args)
+                self.assertEqual(
+                    os.environ["ASCEND_RT_VISIBLE_DEVICES"], "2,3"
+                )
+        self.assertEqual(args.tensor_parallel_size, 2)
+
+    def test_parallel_size_must_match_visible_devices(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = make_args(root, ascend_devices="0,1", tensor_parallel_size=1)
+            with self.assertRaises(ValueError):
+                configure_ascend_devices(args)
+
+    @patch("llm_interfaces.main._infer_one_case")
+    def test_two_modes_are_called_directly_in_order(self, infer_one_case):
         with tempfile.TemporaryDirectory() as root:
             for name in ("competition", "cooperation"):
                 (Path(root) / f"{name}.json").write_text(
                     json.dumps({"semantic_labels": {"sop": ""}}),
                     encoding="utf-8",
                 )
-            args = make_args(root)
-            context = FakeContext()
+            args = make_args(root, ascend_devices="0")
+            with patch.dict(os.environ, {}, clear=False):
+                run(args)
 
-            run(args, process_context=context)
-
-        self.assertEqual(context.events, [
-            "start:competition_one_case",
-            "join:competition_one_case",
-            "start:cooperation_one_case",
-            "join:cooperation_one_case",
-        ])
+        self.assertEqual(infer_one_case.call_count, 2)
         self.assertEqual(
-            context.processes[0].kwargs["label"],
+            [item.kwargs["mode"] for item in infer_one_case.call_args_list],
+            ["competition", "cooperation"],
+        )
+        self.assertEqual(
+            infer_one_case.call_args_list[0].kwargs["label"],
             {"semantic_labels": {"sop": ""}},
         )
-        self.assertEqual(context.processes[0].kwargs["mode"], "competition")
-        self.assertEqual(context.processes[1].kwargs["mode"], "cooperation")
+        self.assertEqual(
+            infer_one_case.call_args_list[0].kwargs["tensor_parallel_size"],
+            1,
+        )
 
 
 if __name__ == "__main__":
