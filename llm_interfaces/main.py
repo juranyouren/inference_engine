@@ -161,14 +161,13 @@ def run(args: argparse.Namespace) -> None:
 
     for mode, json_path, alarm_type in jobs:
         label = load_json_case(json_path)
-        mode_output_dir = str(output_root / mode)
         print(f"开始 {mode} 单 case 测试: {json_path}")
         _infer_one_case(
             mode=mode,
             model_path=args.model_path,
             label=label,
             alarm_type=alarm_type,
-            output_dir=mode_output_dir,
+            output_dir=str(output_root),
             batch_size=args.batch_size,
             max_rounds=args.max_rounds,
             tensor_parallel_size=args.tensor_parallel_size,
@@ -197,7 +196,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cooperation-json")
     parser.add_argument("--competition-alarm-type")
     parser.add_argument("--cooperation-alarm-type")
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--output-dir",
+        default="res",
+        help="结果根目录，默认 res。",
+    )
     parser.add_argument(
         "--ascend-devices",
         help=(

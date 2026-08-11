@@ -19,6 +19,8 @@ class InferenceCase:
     semantic_labels: Dict[str, Any]
     sop: str
     root_cause_candidates: Any
+    groundtruth: str
+    ttm: Any
 
 
 def _sop_to_text(value: Any) -> str:
@@ -44,6 +46,17 @@ def _root_cause_candidates(label: Dict[str, Any]) -> Any:
             or root_cause.get("root_cause", "")
         )
     return [root_cause] if root_cause else []
+
+
+def _groundtruth(label: Dict[str, Any]) -> str:
+    root_cause = label.get("root_cause", "")
+    if isinstance(root_cause, dict):
+        root_cause = (
+            root_cause.get("category", "")
+            or root_cause.get("name", "")
+            or root_cause.get("root_cause", "")
+        )
+    return str(root_cause).strip() if root_cause is not None else ""
 
 
 def _case_id(label: Dict[str, Any], input_index: int) -> str:
@@ -107,6 +120,8 @@ def normalize_case(
         semantic_labels=semantic_labels,
         sop=sop,
         root_cause_candidates=_root_cause_candidates(label),
+        groundtruth=_groundtruth(label),
+        ttm=label.get("ttm", semantic_labels.get("ttm")),
     )
 
 

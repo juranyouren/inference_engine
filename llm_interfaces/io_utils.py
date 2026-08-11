@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import json
+import re
 from pathlib import Path
-from typing import Any, Iterable, Iterator, List, TypeVar
+from typing import Any, Dict, Iterable, Iterator, List, TypeVar
 
 
 T = TypeVar("T")
@@ -31,6 +33,21 @@ def save_json(data: Any, path: str | Path) -> None:
 
 def case_output_dir(output_dir: str | Path, input_index: int) -> Path:
     return ensure_dir(Path(output_dir) / f"case_{input_index:06d}")
+
+
+def safe_category_name(category: Any) -> str:
+    value = str(category).strip() if category is not None else ""
+    if not value:
+        return "_unknown"
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
+    return value if value not in (".", "..") else "_unknown"
+
+
+def category_output_dir(
+    mode_output_dir: str | Path,
+    category: Any,
+) -> Path:
+    return ensure_dir(Path(mode_output_dir) / safe_category_name(category))
 
 
 def iter_batches(items: List[T], batch_size: int) -> Iterator[List[T]]:
@@ -69,3 +86,53 @@ def save_batch_results(
         "results": result_list,
     }
     save_json(payload, Path(output_dir) / "results.json")
+
+
+CSV_FIELDS = (
+    "case_idx",
+    "timestamp",
+    "incident_type",
+    "predicted_list",
+    "groundtruth",
+    "rank",
+    "ttm",
+    "predicted_list_v1",
+    "rank_v1",
+)
+
+
+def save_category_csvs(
+    mode_output_dir: str | Path,
+    results: Iterable[Dict[str, Any]],
+) -> None:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for result in results:
+        category = str(result.get("incident_type") or "_unknown")
+        grouped.setdefault(category, []).append(result)
+
+    for category, category_results in grouped.items():
+        csv_path = category_output_dir(mode_output_dir, category) / "results.csv"
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            for result in sorted(
+                category_results,
+                key=lambda item: int(item.get("case_idx", 0)),
+            ):
+                writer.writerow({
+                    "case_idx": result.get("case_idx"),
+                    "timestamp": result.get("timestamp"),
+                    "incident_type": result.get("incident_type"),
+                    "predicted_list": json.dumps(
+                        result.get("predicted_list", []),
+                        ensure_ascii=False,
+                    ),
+                    "groundtruth": result.get("groundtruth"),
+                    "rank": result.get("rank"),
+                    "ttm": result.get("ttm"),
+                    "predicted_list_v1": json.dumps(
+                        result.get("predicted_list_v1", []),
+                        ensure_ascii=False,
+                    ),
+                    "rank_v1": result.get("rank_v1"),
+                })

@@ -91,6 +91,10 @@ class LlmInterfacesMainTests(unittest.TestCase):
             infer_one_case.call_args_list[0].kwargs["tensor_parallel_size"],
             1,
         )
+        self.assertEqual(
+            infer_one_case.call_args_list[0].kwargs["output_dir"],
+            str((Path(root) / "output").resolve()),
+        )
 
 
 if __name__ == "__main__":

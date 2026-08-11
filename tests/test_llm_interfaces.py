@@ -1,3 +1,4 @@
+import csv
 import json
 import tempfile
 import unittest
@@ -72,6 +73,8 @@ def competition_label():
             {"category": "链路故障"},
             {"category": "配置错误"},
         ],
+        "root_cause": {"category": "链路故障"},
+        "ttm": 16.0,
     }
 
 
@@ -87,6 +90,8 @@ def cooperation_label():
             {"category": "链路故障"},
             {"category": "配置错误"},
         ],
+        "root_cause": {"category": "链路故障"},
+        "ttm": 50.0,
     }
 
 
@@ -110,7 +115,7 @@ class LlmInterfaceTests(unittest.TestCase):
             self.assertEqual(second[0]["status"], "success")
             self.assertEqual(len(first[0]["reasoner_outputs"]), 3)
             self.assertTrue(
-                (Path(root) / "first" / "results.json").exists()
+                (Path(root) / "first" / "competition" / "results.json").exists()
             )
 
     def test_cooperation_stops_on_marker_and_saves_rounds(self):
@@ -118,7 +123,7 @@ class LlmInterfaceTests(unittest.TestCase):
         factory = CountingFactory([
             "meta-round-0",
             "reasoner-round-0",
-            f"meta-round-1 {marker}",
+            f'meta-round-1 {marker}\n["链路故障", "配置错误"]',
         ])
         with tempfile.TemporaryDirectory() as root:
             engine = CooperationInference(
@@ -136,8 +141,26 @@ class LlmInterfaceTests(unittest.TestCase):
             self.assertEqual(results[0]["round_count"], 2)
             self.assertEqual(len(results[0]["rounds"]), 2)
             self.assertIsNone(results[0]["rounds"][1]["reasoner_output"])
+            self.assertEqual(results[0]["predicted_list"], [
+                "链路故障", "配置错误",
+            ])
+            self.assertEqual(results[0]["rank"], 1)
             self.assertTrue(
-                (Path(root) / "case_000000" / "result.json").exists()
+                (
+                    Path(root)
+                    / "cooperation"
+                    / "BGP邻接状态改变"
+                    / "case_000000"
+                    / "result.json"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    Path(root)
+                    / "cooperation"
+                    / "BGP邻接状态改变"
+                    / "results.csv"
+                ).exists()
             )
 
     def test_sop_is_read_only_from_semantic_labels(self):
@@ -169,13 +192,75 @@ class LlmInterfaceTests(unittest.TestCase):
             )
             results = engine.infer([bad, competition_label()], root)
             payload = json.loads(
-                (Path(root) / "results.json").read_text(encoding="utf-8")
+                (Path(root) / "competition" / "results.json").read_text(
+                    encoding="utf-8"
+                )
             )
 
         self.assertEqual(results[0]["status"], "failed")
         self.assertEqual(results[1]["status"], "success")
         self.assertEqual(payload["summary"]["failed_count"], 1)
         self.assertEqual(payload["summary"]["success_count"], 1)
+
+    def test_competition_writes_category_csv_using_list_index(self):
+        categories = [f"根因{i}" for i in range(1, 7)]
+        label = competition_label()
+        label["case_id"] = "不是case_idx"
+        label["root_cause_candidates"] = [
+            {"category": category} for category in categories
+        ]
+        label["root_cause"] = {"category": "根因6"}
+        verifier_response = json.dumps(categories, ensure_ascii=False)
+        factory = CountingFactory([
+            "reasoner-1",
+            "reasoner-2",
+            "reasoner-3",
+            verifier_response,
+        ])
+
+        with tempfile.TemporaryDirectory() as root:
+            engine = CompetitionInference(
+                "fake-model",
+                alarm_type="BGP邻接状态改变",
+                llm_factory=factory,
+                sampling_params_factory=fake_sampling_params,
+            )
+            results = engine.infer([label], root)
+            csv_path = (
+                Path(root)
+                / "competition"
+                / "BGP邻接状态改变"
+                / "results.csv"
+            )
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.DictReader(file))
+
+        self.assertEqual(results[0]["case_idx"], 0)
+        self.assertEqual(results[0]["predicted_list"], categories[:5])
+        self.assertEqual(results[0]["predicted_list_v1"], categories)
+        self.assertIsNone(results[0]["rank"])
+        self.assertEqual(results[0]["rank_v1"], 6)
+        self.assertEqual(list(rows[0]), [
+            "case_idx",
+            "timestamp",
+            "incident_type",
+            "predicted_list",
+            "groundtruth",
+            "rank",
+            "ttm",
+            "predicted_list_v1",
+            "rank_v1",
+        ])
+        self.assertEqual(rows[0]["case_idx"], "0")
+        self.assertEqual(rows[0]["incident_type"], "BGP邻接状态改变")
+        self.assertEqual(json.loads(rows[0]["predicted_list"]), categories[:5])
+        self.assertEqual(
+            json.loads(rows[0]["predicted_list_v1"]), categories,
+        )
+        self.assertEqual(rows[0]["groundtruth"], "根因6")
+        self.assertEqual(rows[0]["ttm"], "16.0")
+        self.assertEqual(rows[0]["rank"], "")
+        self.assertEqual(rows[0]["rank_v1"], "6")
 
 
 if __name__ == "__main__":

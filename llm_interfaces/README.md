@@ -53,7 +53,18 @@ results = engine.infer(label_list, "/path/to/output")
 ```
 
 每个 case 的 prompt、原始响应和 `result.json` 会保存到
-`output/case_XXXXXX/`；整个批次的汇总保存在 `output/results.json`。
+`output/<mode>/<category>/case_XXXXXX/`；模式级汇总保存在
+`output/<mode>/results.json`。
+
+每个类别还会生成 `output/<mode>/<category>/results.csv`，列顺序为：
+
+```text
+case_idx,timestamp,incident_type,predicted_list,groundtruth,rank,ttm,predicted_list_v1,rank_v1
+```
+
+其中 `case_idx` 直接使用输入列表下标；`predicted_list` 是完整模型排序的前 5 项，
+`predicted_list_v1` 是完整排序。`groundtruth` 读取 `root_cause.category`，`ttm`
+读取输入 JSON 的同名字段，缺失时留空。
 
 ## 两个接口各测试一个 case
 
@@ -69,7 +80,7 @@ python -m llm_interfaces.main \
   --competition-alarm-type BGP邻接状态改变 \
   --cooperation-alarm-type BGP邻接状态改变 \
   --ascend-devices 0,1 \
-  --output-dir /path/to/test_output
+  --output-dir res
 ```
 
 如果 JSON 本身包含 `alarm_type`，对应的 `--*-alarm-type` 参数可以省略。也可以用
@@ -79,6 +90,9 @@ python -m llm_interfaces.main \
 `ASCEND_RT_VISIBLE_DEVICES=0,1`，并自动使用 `tensor_parallel_size=2`。指定四张卡时可传
 `--ascend-devices 0,1,2,3`，张量并行度会自动设为 4。通常不需要再传
 `--tensor-parallel-size`；如果显式传入，其数值必须与卡号数量一致。
+
+`--output-dir` 默认就是 `res`，可以省略。最终 CSV 路径为
+`res/<mode>/<category>/results.csv`。
 
 注意：两个类虽然按顺序初始化，但 vLLM/Ascend 运行时在同一个进程中不保证第一个
 模型的显存能够完全释放。如果模型无法同时容纳或第二次初始化失败，应分别使用

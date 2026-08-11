@@ -10,12 +10,15 @@ from .data_adapter import InferenceCase, normalize_case, truncate_history
 from .generator import RCAGenerator
 from .io_utils import (
     case_output_dir,
+    category_output_dir,
     ensure_dir,
     iter_batches,
     save_batch_results,
+    save_category_csvs,
     save_case_result,
     save_text,
 )
+from .result_parser import build_prediction_fields
 
 
 EARLY_STOP_MARKER = '["(上一轮次已经符合要求)"]'
@@ -81,10 +84,20 @@ class CooperationInference:
     ) -> Dict[str, Any]:
         return {
             "input_index": input_index,
+            "case_idx": input_index,
             "case_id": case_id,
             "mode": "cooperation",
             "status": "pending",
             "output_dir": str(output_dir.resolve()),
+            "timestamp": None,
+            "incident_type": None,
+            "groundtruth": "",
+            "rank": None,
+            "ttm": None,
+            "predicted_list": [],
+            "predicted_list_v1": [],
+            "rank_v1": None,
+            "parse_strategy": "unparsed",
             "round_count": 0,
             "early_stopped": False,
             "rounds": [],
@@ -97,6 +110,22 @@ class CooperationInference:
     def _fail(result: Dict[str, Any], error: Exception | str) -> None:
         result["status"] = "failed"
         result["error"] = str(error)
+        save_case_result(result)
+
+    @staticmethod
+    def _succeed(
+        result: Dict[str, Any],
+        case: InferenceCase,
+        response: str,
+    ) -> None:
+        result["status"] = "success"
+        result["final_result"] = response
+        result.update(build_prediction_fields(
+            response,
+            case.root_cause_candidates,
+            case.groundtruth,
+        ))
+        result["error"] = None
         save_case_result(result)
 
     def _last_round_outputs(self, state: Dict[str, Any]) -> str:
@@ -161,12 +190,20 @@ class CooperationInference:
         input_list: List[Dict[str, Any]],
         output_dir: str | Path,
     ) -> List[Dict[str, Any]]:
-        output_root = ensure_dir(output_dir)
+        output_root = ensure_dir(Path(output_dir) / "cooperation")
         results: List[Dict[str, Any]] = []
         valid_items: List[tuple[InferenceCase, Dict[str, Any]]] = []
 
         for input_index, label in enumerate(input_list):
-            current_output_dir = case_output_dir(output_root, input_index)
+            raw_category = (
+                label.get("alarm_type") or self.alarm_type
+                if isinstance(label, dict)
+                else self.alarm_type
+            )
+            current_output_dir = case_output_dir(
+                category_output_dir(output_root, raw_category),
+                input_index,
+            )
             raw_case_id = (
                 str(label.get("case_id", label.get("id", input_index)))
                 if isinstance(label, dict)
@@ -177,6 +214,9 @@ class CooperationInference:
                 case_id=raw_case_id,
                 output_dir=current_output_dir,
             )
+            result["incident_type"] = raw_category
+            if isinstance(label, dict):
+                result["timestamp"] = label.get("alarm_time")
             results.append(result)
             try:
                 case = normalize_case(
@@ -186,6 +226,10 @@ class CooperationInference:
                     default_alarm_type=self.alarm_type,
                 )
                 result["case_id"] = case.case_id
+                result["timestamp"] = case.alarm_time
+                result["incident_type"] = case.alarm_type
+                result["groundtruth"] = case.groundtruth
+                result["ttm"] = case.ttm
                 valid_items.append((case, result))
             except (TypeError, ValueError) as exc:
                 self._fail(result, exc)
@@ -251,12 +295,11 @@ class CooperationInference:
                     state["result"]["round_count"] = round_index + 1
 
                     if EARLY_STOP_MARKER in meta_response:
-                        state["result"]["status"] = "success"
                         state["result"]["early_stopped"] = True
-                        state["result"]["final_result"] = meta_response
-                        state["result"]["error"] = None
                         state["done"] = True
-                        save_case_result(state["result"])
+                        self._succeed(
+                            state["result"], state["case"], meta_response,
+                        )
                         continue
 
                     reasoner_states.append(state)
@@ -305,11 +348,10 @@ class CooperationInference:
             for state in states:
                 result = state["result"]
                 if result["status"] == "pending":
-                    result["status"] = "success"
                     # Meta 输出包含根因排序；Reasoner 输出是供下一轮 Meta 使用的分析。
-                    result["final_result"] = state["last_meta"]
-                    result["error"] = None
-                    save_case_result(result)
+                    self._succeed(
+                        result, state["case"], state["last_meta"] or "",
+                    )
 
         save_batch_results(
             mode="cooperation",
@@ -317,4 +359,5 @@ class CooperationInference:
             output_dir=output_root,
             results=results,
         )
+        save_category_csvs(output_root, results)
         return results
