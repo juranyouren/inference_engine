@@ -55,6 +55,20 @@ def test_joint_scoring_normalizes_and_sorts_scores() -> None:
     assert sum(item["score"] for item in ranked) == 1.0
 
 
+def test_incomplete_model_ranking_is_marked_invalid_for_evaluation() -> None:
+    ranked, strategy = normalize_joint_scoring(
+        {
+            "ranked_candidates": [
+                {"category": "根因A", "score": 1.0},
+            ]
+        },
+        ["根因A", "根因B"],
+    )
+
+    assert [item["category"] for item in ranked] == ["根因A", "根因B"]
+    assert strategy == "incomplete_scored_ranking"
+
+
 def test_stage1_flow_writes_ranked_prediction(tmp_path: Path) -> None:
     alarm_type = "BGP邻接状态改变"
     data_dir = tmp_path / "input" / alarm_type
@@ -100,6 +114,18 @@ def test_stage1_flow_writes_ranked_prediction(tmp_path: Path) -> None:
     assert (final_dir / "predictions.json").is_file()
     assert (final_dir / "predictions.jsonl").is_file()
     assert (final_dir / "predictions.csv").is_file()
+    assert (final_dir / "evaluation" / "metrics.json").is_file()
+    assert (final_dir / "evaluation" / "metrics.csv").is_file()
     assert (final_dir / "0" / "alert_summary" / "prompt.txt").is_file()
     assert (final_dir / "0" / "anomaly_analysis" / "parsed.json").is_file()
     assert (final_dir / "0" / "joint_scoring" / "raw_responses.txt").is_file()
+
+    metrics = json.loads(
+        (final_dir / "evaluation" / "metrics.json").read_text(encoding="utf-8")
+    )["metrics"]
+    overall = next(item for item in metrics if item["scope"] == "overall")
+    assert overall["top1"] == 1.0
+    assert overall["top3"] == 1.0
+    assert overall["top5"] == 1.0
+    assert overall["mrr"] == 1.0
+    assert payload["meta"]["timing"]["elapsed_seconds"] >= 0.0

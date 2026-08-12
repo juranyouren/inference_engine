@@ -95,6 +95,7 @@ def normalize_joint_scoring(
         })
         seen.add(category)
 
+    has_complete_model_ranking = bool(items) and seen == candidate_set
     for category in candidates:
         if category not in seen:
             ranked.append({
@@ -109,7 +110,12 @@ def normalize_joint_scoring(
     if all(item["score"] is None for item in ranked):
         for item in ranked:
             item["score"] = 1.0 / len(ranked)
-        strategy = "ranking_only" if has_model_ranking else "candidate_order_fallback"
+        if not has_model_ranking:
+            strategy = "candidate_order_fallback"
+        elif has_complete_model_ranking:
+            strategy = "ranking_only"
+        else:
+            strategy = "incomplete_ranking"
         return ranked, strategy
 
     for item in ranked:
@@ -123,4 +129,9 @@ def normalize_joint_scoring(
         for item in ranked:
             item["score"] /= total
     ranked.sort(key=lambda item: item["score"], reverse=True)
-    return ranked, "scored_ranking"
+    strategy = (
+        "scored_ranking"
+        if has_complete_model_ranking
+        else "incomplete_scored_ranking"
+    )
+    return ranked, strategy

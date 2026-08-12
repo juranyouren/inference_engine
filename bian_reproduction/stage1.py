@@ -4,9 +4,11 @@ import csv
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from bian_reproduction.evaluate import build_evaluation_report, write_evaluation_report
 from bian_reproduction.parsing import (
     normalize_candidates,
     normalize_joint_scoring,
@@ -139,30 +141,35 @@ class BianStage1Runner:
         self.max_new_tokens = max_new_tokens
         self.llm = None
         self.sampling_params = None
+        self.model_init_seconds = 0.0
 
     def _init_model(self) -> None:
         if self.llm is not None:
             return
-        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-        if self.visible_devices:
-            os.environ["ASCEND_RT_VISIBLE_DEVICES"] = self.visible_devices
-        from vllm import LLM, SamplingParams
+        started = time.perf_counter()
+        try:
+            os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+            if self.visible_devices:
+                os.environ["ASCEND_RT_VISIBLE_DEVICES"] = self.visible_devices
+            from vllm import LLM, SamplingParams
 
-        tensor_parallel_size = len(
-            [item for item in self.visible_devices.split(",") if item.strip()]
-        ) or 1
-        self.llm = LLM(
-            model=self.model_path,
-            tensor_parallel_size=tensor_parallel_size,
-            trust_remote_code=True,
-            gpu_memory_utilization=0.9,
-            max_model_len=16384,
-        )
-        self.sampling_params = SamplingParams(
-            temperature=0.2,
-            top_p=0.9,
-            max_tokens=self.max_new_tokens,
-        )
+            tensor_parallel_size = len(
+                [item for item in self.visible_devices.split(",") if item.strip()]
+            ) or 1
+            self.llm = LLM(
+                model=self.model_path,
+                tensor_parallel_size=tensor_parallel_size,
+                trust_remote_code=True,
+                gpu_memory_utilization=0.9,
+                max_model_len=16384,
+            )
+            self.sampling_params = SamplingParams(
+                temperature=0.2,
+                top_p=0.9,
+                max_tokens=self.max_new_tokens,
+            )
+        finally:
+            self.model_init_seconds += time.perf_counter() - started
 
     def _invoke(self, prompts: Sequence[str]) -> List[str]:
         self._init_model()
@@ -203,6 +210,24 @@ class BianStage1Runner:
         indices: Sequence[int],
         output_dir: str,
     ) -> Dict[str, Any]:
+        run_started = time.perf_counter()
+        init_before_run = self.model_init_seconds
+        stage_seconds = {
+            "alert_summary_seconds": 0.0,
+            "anomaly_analysis_seconds": 0.0,
+            "joint_scoring_seconds": 0.0,
+        }
+
+        def invoke_stage(stage_name: str, prompts: Sequence[str]) -> List[str]:
+            init_before_stage = self.model_init_seconds
+            stage_started = time.perf_counter()
+            try:
+                return self._invoke(prompts)
+            finally:
+                wall_seconds = time.perf_counter() - stage_started
+                init_seconds = self.model_init_seconds - init_before_stage
+                stage_seconds[stage_name] += max(0.0, wall_seconds - init_seconds)
+
         data_path = Path(data_dir).resolve()
         selected = sorted(set(int(idx) for idx in indices))
         if not selected:
@@ -258,7 +283,9 @@ class BianStage1Runner:
                     )
                     for item in records
                 ]
-                summary_responses = self._invoke(summary_prompts)
+                summary_responses = invoke_stage(
+                    "alert_summary_seconds", summary_prompts
+                )
                 if len(summary_responses) != len(records):
                     raise RuntimeError("告警摘要响应数量不匹配")
 
@@ -273,7 +300,9 @@ class BianStage1Runner:
                     )
                     for item, summary in zip(records, summary_responses)
                 ]
-                anomaly_responses = self._invoke(anomaly_prompts)
+                anomaly_responses = invoke_stage(
+                    "anomaly_analysis_seconds", anomaly_prompts
+                )
                 if len(anomaly_responses) != len(records):
                     raise RuntimeError("异常分析响应数量不匹配")
 
@@ -291,7 +320,9 @@ class BianStage1Runner:
                         anomaly_responses,
                     )
                 ]
-                joint_responses = self._invoke(joint_prompts)
+                joint_responses = invoke_stage(
+                    "joint_scoring_seconds", joint_prompts
+                )
                 if len(joint_responses) != len(records):
                     raise RuntimeError("联合评分响应数量不匹配")
 
@@ -338,6 +369,23 @@ class BianStage1Runner:
         processed = sorted(set(processed))
         skipped = sorted(set(skipped) - set(processed))
         results.sort(key=lambda item: item["case_idx"])
+        model_init_seconds = self.model_init_seconds - init_before_run
+        wall_clock_seconds = time.perf_counter() - run_started
+        elapsed_seconds = max(0.0, wall_clock_seconds - model_init_seconds)
+        timing = {
+            "model_init_seconds": model_init_seconds,
+            **stage_seconds,
+            "model_inference_seconds": sum(stage_seconds.values()),
+            "elapsed_seconds": elapsed_seconds,
+            "wall_clock_seconds": wall_clock_seconds,
+            "average_seconds_per_case": (
+                elapsed_seconds / len(selected) if selected else None
+            ),
+            "timing_scope": (
+                "完整第一阶段端到端耗时；model_init_seconds 单独记录，"
+                "elapsed_seconds 不含模型初始化"
+            ),
+        }
         payload = {
             "meta": {
                 "pipeline": "bian_stage1",
@@ -347,6 +395,7 @@ class BianStage1Runner:
                 "indices": selected,
                 "model_path": self.model_path,
                 "output_dir": str(final_dir),
+                "timing": timing,
             },
             "summary": {
                 "processed_count": len(processed),
@@ -385,5 +434,6 @@ class BianStage1Runner:
             json.dumps(payload["meta"], ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        report = build_evaluation_report([payload])
+        write_evaluation_report(report, final_dir / "evaluation")
         return payload
-

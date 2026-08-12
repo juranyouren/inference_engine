@@ -14,9 +14,11 @@
 
 ```text
 input_root/
-└── 告警类别/
-    ├── 告警类别_0_label_x.json
-    └── 告警类别_1_label_x.json
+├── 告警类别A/
+│   ├── 告警类别A_0_label_x.json
+│   └── 告警类别A_1_label_x.json
+└── 告警类别B/
+    └── 告警类别B_0_label_x.json
 ```
 
 输入 JSON 至少包含：
@@ -48,6 +50,20 @@ python -m bian_reproduction.run_stage1 \
   --end 1
 ```
 
+一次传入四种类别（同一个模型只加载一次）：
+
+```bash
+python -m bian_reproduction.run_stage1 \
+  --input-root /path/to/input_root \
+  --alarm-types "BGP邻接状态改变" "网络设备掉线" \
+                "接口状态DOWN" "入方向带宽利用率过高" \
+  --output-dir /path/to/bian_output \
+  --start 0 \
+  --end 50
+```
+
+`--start/--end` 会分别应用于每个类别，区间为 `[start, end)`。类别参数没有硬编码，也可以传入一个、两个或更多类别；`--alarm-type` 和 `--alarm-types` 两种写法等价。
+
 输出位于：
 
 ```text
@@ -56,6 +72,9 @@ bian_output/llm_infer_bian_stage1/告警类别/idx_0_0/
 ├── predictions.jsonl
 ├── predictions.csv
 ├── meta.json
+├── evaluation/
+│   ├── metrics.json
+│   └── metrics.csv
 └── 0/
     ├── alert_summary/
     ├── anomaly_analysis/
@@ -63,3 +82,35 @@ bian_output/llm_infer_bian_stage1/告警类别/idx_0_0/
     └── prediction.json
 ```
 
+多类别运行还会生成跨类别汇总：
+
+```text
+bian_output/llm_infer_bian_stage1/evaluation/
+├── metrics.json
+└── metrics.csv
+```
+
+运行第一阶段后会自动生成评价结果。也可以对已有结果单独评价：
+
+```bash
+python -m bian_reproduction.evaluate \
+  --predictions /path/to/idx_0_49/predictions.json
+```
+
+汇总多个运行结果：
+
+```bash
+python -m bian_reproduction.evaluate \
+  --predictions /path/to/run_a /path/to/run_b \
+  --output-dir /path/to/evaluation
+```
+
+评价指标包括 Top-1、Top-3、Top-5、MRR、三个推理阶段耗时、端到端总耗时和平均每 case 耗时：
+
+```text
+Top@K = 真实根因排名不超过 K 的 case 数 / 有标签 case 总数
+MRR   = sum(1 / 真实根因排名；未命中为 0) / 有标签 case 总数
+Time  = elapsed_seconds / evaluated_count
+```
+
+模型加载时间单独记录，不计入端到端平均推理时间。无法解析、排序不完整、候选顺序回退以及推理跳过的 case 均按未命中计算。
