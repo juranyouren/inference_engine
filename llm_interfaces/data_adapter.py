@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal
 
 
 InferenceMode = Literal["competition", "cooperation"]
@@ -72,7 +72,7 @@ def normalize_case(
     *,
     input_index: int,
     mode: InferenceMode,
-    default_alarm_type: Optional[str] = None,
+    alarm_type: str,
 ) -> InferenceCase:
     """校验单条输入。
 
@@ -90,12 +90,8 @@ def normalize_case(
             f"input_list[{input_index}].semantic_labels 必须是字典"
         )
 
-    alarm_type = label.get("alarm_type") or default_alarm_type
     if not alarm_type or not str(alarm_type).strip():
-        raise ValueError(
-            f"input_list[{input_index}] 缺少 alarm_type；"
-            "请在 JSON 中提供，或在类初始化时传入 alarm_type"
-        )
+        raise ValueError("alarm_type 不能为空")
 
     sop = _sop_to_text(semantic_labels.get("sop"))
     if mode == "competition" and not sop:

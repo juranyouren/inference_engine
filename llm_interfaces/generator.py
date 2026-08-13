@@ -1,14 +1,10 @@
-"""只包含两个接口所需的模型加载和生成方法。"""
+"""只包含两个接口所需的生成方法。"""
 
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-
-# 必须在导入 vLLM / torch_npu 之前设置。
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 from .invoke import vllm_invoke
 from .prompts import (
@@ -19,64 +15,34 @@ from .prompts import (
 )
 
 
-def _visible_device_count() -> int:
-    devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
-    visible = [item.strip() for item in devices.split(",") if item.strip()]
-    return len(visible) or 1
-
-
 class RCAGenerator:
-    """构造时加载一次模型，生成方法只复用已有模型。"""
+    """使用已经加载完成的 LLMEngine 执行生成。"""
 
     def __init__(
         self,
-        model_path: str,
+        engine: Any,
         *,
         batch_size: int = 8,
-        tensor_parallel_size: Optional[int] = None,
-        gpu_memory_utilization: float = 0.9,
-        max_model_len: int = 16384,
         max_tokens: int = 4096,
         prompt_safety_tokens: int = 512,
-        model_options: Optional[Dict[str, Any]] = None,
-        llm_factory: Optional[Callable[..., Any]] = None,
         sampling_params_factory: Optional[Callable[..., Any]] = None,
     ) -> None:
-        if not model_path:
-            raise ValueError("model_path 不能为空")
+        if engine is None or not hasattr(engine, "llm"):
+            raise TypeError("engine 必须是包含 llm 属性的 LLMEngine 实例")
         if batch_size <= 0:
             raise ValueError("batch_size 必须大于 0")
 
-        if llm_factory is None or sampling_params_factory is None:
-            from vllm import LLM, SamplingParams
+        if sampling_params_factory is None:
+            from vllm import SamplingParams
 
-            llm_factory = llm_factory or LLM
-            sampling_params_factory = sampling_params_factory or SamplingParams
+            sampling_params_factory = SamplingParams
 
-        options = dict(model_options or {})
-        if "model" in options:
-            raise ValueError("model_options 中不能覆盖 model")
-        options.update({
-            "model": model_path,
-            "tensor_parallel_size": (
-                tensor_parallel_size
-                if tensor_parallel_size is not None
-                else _visible_device_count()
-            ),
-            "trust_remote_code": True,
-            "gpu_memory_utilization": gpu_memory_utilization,
-            "max_model_len": max_model_len,
-        })
-
-        self.model_path = model_path
+        self.engine = engine
+        self.llm = engine.llm
         self.batch_size = batch_size
         self.max_tokens = max_tokens
         self.prompt_safety_tokens = prompt_safety_tokens
         self._sampling_params_factory = sampling_params_factory
-
-        # 唯一的模型加载点。infer/generate 方法不会再次执行该工厂。
-        self.llm = llm_factory(**options)
-        print(f"LLM模型已初始化: {model_path}")
 
     @staticmethod
     def _filtered_semantic_labels(

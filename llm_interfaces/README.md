@@ -5,8 +5,8 @@
 - `CompetitionInference`：三个 Reasoner 完成多采样推理，再由 Verifier 输出最终结果。
 - `CooperationInference`：Meta 与 Reasoner 多轮协作，支持早停。
 
-导入模块不会加载模型。实例化所选择的类时加载一次模型，同一实例后续多次调用
-`infer()` 都会复用该模型。不要同时实例化两个模式；调用方根据本次任务选择其中一个。
+模型由 `LLMEngine.get_instance()` 第一次调用时加载。Competition、Cooperation、
+Selector 和 Refiner 都可以接收同一个 engine 实例，整个 main 进程只加载一次模型。
 
 ## 输入
 
@@ -16,9 +16,8 @@
 - Competition 要求 SOP 非空。
 - Cooperation 要求 SOP 为空。
 
-每条 JSON 可以包含 `alarm_type`；如果原始 label 中没有该字段，请在类初始化时统一
-传入 `alarm_type`。`case_id`、`id`、`index` 或 `idx` 可用于标识结果；均不存在时使用
-列表下标。
+告警类别作为 `infer(input_list, alarm_type, output_dir)` 的第二个参数显式传入，JSON
+中的 `alarm_type` 不参与本次推理类别选择。`case_idx` 直接使用输入列表下标。
 
 ## Competition 示例
 
@@ -26,16 +25,22 @@
 import json
 
 from llm_interfaces.competition import CompetitionInference
+from llm_interfaces.llm_engine import LLMEngine
 
 with open("label.json", "r", encoding="utf-8") as file:
     label = json.load(file)
 
-engine = CompetitionInference(
+engine = LLMEngine.get_instance(
     model_path="/path/to/model",
-    alarm_type="BGP邻接状态改变",
-    batch_size=8,
+    gpu_memory_utilization=0.9,
+    max_model_len=16384,
 )
-results = engine.infer([label], "/path/to/output")
+competition = CompetitionInference(engine)
+results = competition.infer(
+    [label],
+    "BGP邻接状态改变",
+    "/path/to/output",
+)
 ```
 
 ## Cooperation 示例
@@ -43,14 +48,16 @@ results = engine.infer([label], "/path/to/output")
 ```python
 from llm_interfaces.cooperation import CooperationInference
 
-engine = CooperationInference(
-    model_path="/path/to/model",
-    alarm_type="BGP邻接状态改变",
-    batch_size=8,
-    max_rounds=5,
+cooperation = CooperationInference(engine)
+results = cooperation.infer(
+    label_list,
+    "BGP邻接状态改变",
+    "/path/to/output",
 )
-results = engine.infer(label_list, "/path/to/output")
 ```
+
+两个 `infer()` 都返回 `list[dict]`，每个字典只包含与 CSV 一致的九个字段，必有
+`predicted_list` 和 `rank`。
 
 每个 case 的 prompt、原始响应和 `result.json` 会保存到
 `output/<mode>/<category>/case_XXXXXX/`；模式级汇总保存在
@@ -69,8 +76,8 @@ case_idx,timestamp,incident_type,predicted_list,groundtruth,rank,ttm,predicted_l
 ## 两个接口各测试一个 case
 
 下面的入口会读取两个 JSON 文件，并分别以 `[json_dict]` 调用两个接口。两个模式
-直接在 main 进程中串行执行，不创建子进程：先初始化 Competition 类并调用
-`infer()`，完成后再初始化 Cooperation 类并调用 `infer()`。
+直接在 main 进程中串行执行，不创建子进程。main 先调用一次
+`LLMEngine.get_instance()`，再把同一个 engine 传给两个推理类。
 
 ```bash
 python -m llm_interfaces.main \
@@ -83,17 +90,14 @@ python -m llm_interfaces.main \
   --output-dir res
 ```
 
-如果 JSON 本身包含 `alarm_type`，对应的 `--*-alarm-type` 参数可以省略。也可以用
-`--mode competition` 或 `--mode cooperation` 单独测试一种接口。
+`--competition-alarm-type` 和 `--cooperation-alarm-type` 是显式告警类别，测试对应
+模式时必须提供。也可以用 `--mode competition` 或 `--mode cooperation` 单独测试。
 
 `--ascend-devices 0,1` 会在模型初始化前设置
 `ASCEND_RT_VISIBLE_DEVICES=0,1`，并自动使用 `tensor_parallel_size=2`。指定四张卡时可传
-`--ascend-devices 0,1,2,3`，张量并行度会自动设为 4。通常不需要再传
-`--tensor-parallel-size`；如果显式传入，其数值必须与卡号数量一致。
+`--ascend-devices 0,1,2,3`，`LLMEngine` 会根据环境变量中的卡号数量将张量并行度设为 4。
 
 `--output-dir` 默认就是 `res`，可以省略。最终 CSV 路径为
 `res/<mode>/<category>/results.csv`。
 
-注意：两个类虽然按顺序初始化，但 vLLM/Ascend 运行时在同一个进程中不保证第一个
-模型的显存能够完全释放。如果模型无法同时容纳或第二次初始化失败，应分别使用
-`--mode competition` 和 `--mode cooperation` 启动两次 main。
+两个推理类只是共享同一个 `LLMEngine`，不会再次初始化或加载模型。

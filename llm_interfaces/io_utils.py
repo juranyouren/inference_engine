@@ -66,7 +66,6 @@ def save_case_result(result: dict[str, Any]) -> None:
 def save_batch_results(
     *,
     mode: str,
-    model_path: str,
     output_dir: str | Path,
     results: Iterable[dict[str, Any]],
 ) -> None:
@@ -75,7 +74,6 @@ def save_batch_results(
     payload = {
         "meta": {
             "mode": mode,
-            "model_path": model_path,
             "output_dir": str(Path(output_dir).resolve()),
         },
         "summary": {
@@ -101,6 +99,11 @@ CSV_FIELDS = (
 )
 
 
+def csv_result_dict(result: Dict[str, Any]) -> Dict[str, Any]:
+    """返回与 CSV 列一一对应、保留列表类型的结果字典。"""
+    return {field: result.get(field) for field in CSV_FIELDS}
+
+
 def save_category_csvs(
     mode_output_dir: str | Path,
     results: Iterable[Dict[str, Any]],
@@ -119,20 +122,21 @@ def save_category_csvs(
                 category_results,
                 key=lambda item: int(item.get("case_idx", 0)),
             ):
+                row = csv_result_dict(result)
                 writer.writerow({
-                    "case_idx": result.get("case_idx"),
-                    "timestamp": result.get("timestamp"),
-                    "incident_type": result.get("incident_type"),
+                    "case_idx": row["case_idx"],
+                    "timestamp": row["timestamp"],
+                    "incident_type": row["incident_type"],
                     "predicted_list": json.dumps(
-                        result.get("predicted_list", []),
+                        row["predicted_list"] or [],
                         ensure_ascii=False,
                     ),
-                    "groundtruth": result.get("groundtruth"),
-                    "rank": result.get("rank"),
-                    "ttm": result.get("ttm"),
+                    "groundtruth": row["groundtruth"],
+                    "rank": row["rank"],
+                    "ttm": row["ttm"],
                     "predicted_list_v1": json.dumps(
-                        result.get("predicted_list_v1", []),
+                        row["predicted_list_v1"] or [],
                         ensure_ascii=False,
                     ),
-                    "rank_v1": result.get("rank_v1"),
+                    "rank_v1": row["rank_v1"],
                 })

@@ -11,6 +11,7 @@ from .generator import RCAGenerator
 from .io_utils import (
     case_output_dir,
     category_output_dir,
+    csv_result_dict,
     ensure_dir,
     iter_batches,
     save_batch_results,
@@ -24,41 +25,27 @@ from .result_parser import build_prediction_fields
 class CompetitionInference:
     """Competition（3 个 Reasoner + Verifier）推理接口。
 
-    模型在本类初始化时加载一次。后续可以多次调用 infer，期间不会
-    重新加载模型。调用方只应实例化当前需要的推理模式。
+    模型由调用方传入的 LLMEngine 持有，本类不会加载模型。
     """
 
     def __init__(
         self,
-        model_path: str,
+        engine: Any,
         *,
-        alarm_type: Optional[str] = None,
         batch_size: int = 8,
-        tensor_parallel_size: Optional[int] = None,
-        gpu_memory_utilization: float = 0.9,
-        max_model_len: int = 16384,
         max_tokens: int = 4096,
         prompt_safety_tokens: int = 512,
-        model_options: Optional[Dict[str, Any]] = None,
-        llm_factory: Optional[Callable[..., Any]] = None,
         sampling_params_factory: Optional[Callable[..., Any]] = None,
     ) -> None:
-        self.model_path = model_path
-        self.alarm_type = alarm_type
+        self.engine = engine
         self.batch_size = batch_size
         self._infer_lock = threading.Lock()
 
-        # 构造 CompetitionInference 时加载；infer 中不再加载。
         self.generator = RCAGenerator(
-            model_path,
+            engine,
             batch_size=batch_size,
-            tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
             max_tokens=max_tokens,
             prompt_safety_tokens=prompt_safety_tokens,
-            model_options=model_options,
-            llm_factory=llm_factory,
             sampling_params_factory=sampling_params_factory,
         )
         self.llm = self.generator.llm
@@ -119,18 +106,22 @@ class CompetitionInference:
     def infer(
         self,
         input_list: List[Dict[str, Any]],
-        output_dir: str | Path,
+        alarm_type: str,
+        output_dir: str | Path = "res",
     ) -> List[Dict[str, Any]]:
-        """批量推理并落盘，返回与 input_list 顺序一致的结果列表。"""
+        """按给定告警类别批量推理并返回与 CSV 列对应的结果。"""
         if not isinstance(input_list, list):
             raise TypeError("input_list 必须是列表")
+        if not alarm_type or not str(alarm_type).strip():
+            raise ValueError("alarm_type 不能为空")
 
         with self._infer_lock:
-            return self._infer(input_list, output_dir)
+            return self._infer(input_list, str(alarm_type), output_dir)
 
     def _infer(
         self,
         input_list: List[Dict[str, Any]],
+        alarm_type: str,
         output_dir: str | Path,
     ) -> List[Dict[str, Any]]:
         output_root = ensure_dir(Path(output_dir) / "competition")
@@ -138,13 +129,8 @@ class CompetitionInference:
         valid_items: List[tuple[InferenceCase, Dict[str, Any]]] = []
 
         for input_index, label in enumerate(input_list):
-            raw_category = (
-                label.get("alarm_type") or self.alarm_type
-                if isinstance(label, dict)
-                else self.alarm_type
-            )
             current_output_dir = case_output_dir(
-                category_output_dir(output_root, raw_category),
+                category_output_dir(output_root, alarm_type),
                 input_index,
             )
             raw_case_id = (
@@ -157,7 +143,7 @@ class CompetitionInference:
                 case_id=raw_case_id,
                 output_dir=current_output_dir,
             )
-            result["incident_type"] = raw_category
+            result["incident_type"] = alarm_type
             if isinstance(label, dict):
                 result["timestamp"] = label.get("alarm_time")
             results.append(result)
@@ -166,7 +152,7 @@ class CompetitionInference:
                     label,
                     input_index=input_index,
                     mode="competition",
-                    default_alarm_type=self.alarm_type,
+                    alarm_type=alarm_type,
                 )
                 result["case_id"] = case.case_id
                 result["timestamp"] = case.alarm_time
@@ -246,9 +232,8 @@ class CompetitionInference:
 
         save_batch_results(
             mode="competition",
-            model_path=self.model_path,
             output_dir=output_root,
             results=results,
         )
         save_category_csvs(output_root, results)
-        return results
+        return [csv_result_dict(result) for result in results]

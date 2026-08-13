@@ -1,9 +1,14 @@
 import csv
+import importlib
 import json
+import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from llm_interfaces.competition import CompetitionInference
 from llm_interfaces.cooperation import CooperationInference
@@ -45,20 +50,12 @@ class FakeLlm:
         return [FakeOutput(response) for _prompt in prompts]
 
 
-class CountingFactory:
-    def __init__(self, scripted_responses=None):
-        self.calls = 0
-        self.scripted_responses = scripted_responses
-        self.instance = None
-
-    def __call__(self, **kwargs):
-        self.calls += 1
-        self.instance = FakeLlm(self.scripted_responses)
-        return self.instance
-
-
 def fake_sampling_params(**kwargs):
     return SimpleNamespace(n=1, **kwargs)
+
+
+def fake_engine(scripted_responses=None):
+    return SimpleNamespace(llm=FakeLlm(scripted_responses))
 
 
 def competition_label():
@@ -96,51 +93,98 @@ def cooperation_label():
 
 
 class LlmInterfaceTests(unittest.TestCase):
-    def test_competition_loads_model_once_and_reuses_it(self):
-        factory = CountingFactory()
+    def test_two_inference_classes_share_the_same_engine(self):
+        engine = fake_engine()
+        competition = CompetitionInference(
+            engine,
+            sampling_params_factory=fake_sampling_params,
+        )
+        cooperation = CooperationInference(
+            engine,
+            sampling_params_factory=fake_sampling_params,
+        )
+
+        self.assertIs(competition.engine, engine)
+        self.assertIs(cooperation.engine, engine)
+        self.assertIs(competition.llm, engine.llm)
+        self.assertIs(cooperation.llm, engine.llm)
+
+    def test_llm_engine_get_instance_loads_once(self):
+        calls = []
+
+        def fake_llm(**kwargs):
+            calls.append(kwargs)
+            return "loaded-llm"
+
+        fake_vllm = types.ModuleType("vllm")
+        fake_vllm.LLM = fake_llm
+        module_name = "llm_interfaces.llm_engine"
+        previous_module = sys.modules.pop(module_name, None)
+        try:
+            with patch.dict(sys.modules, {"vllm": fake_vllm}):
+                module = importlib.import_module(module_name)
+                module.LLMEngine._instance = None
+                with patch.dict(
+                    os.environ,
+                    {"ASCEND_RT_VISIBLE_DEVICES": "0,1"},
+                ):
+                    first = module.LLMEngine.get_instance(
+                        model_path="fake-model",
+                    )
+                    second = module.LLMEngine.get_instance()
+        finally:
+            sys.modules.pop(module_name, None)
+            if previous_module is not None:
+                sys.modules[module_name] = previous_module
+
+        self.assertIs(first, second)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["model"], "fake-model")
+        self.assertEqual(calls[0]["tensor_parallel_size"], 2)
+
+    def test_competition_reuses_shared_model_across_calls(self):
+        engine_instance = fake_engine()
         with tempfile.TemporaryDirectory() as root:
             engine = CompetitionInference(
-                "fake-model",
-                alarm_type="BGP邻接状态改变",
-                llm_factory=factory,
+                engine_instance,
                 sampling_params_factory=fake_sampling_params,
             )
-            self.assertEqual(factory.calls, 1)
 
-            first = engine.infer([competition_label()], Path(root) / "first")
-            second = engine.infer([competition_label()], Path(root) / "second")
+            first = engine.infer(
+                [competition_label()],
+                "BGP邻接状态改变",
+                Path(root) / "first",
+            )
+            second = engine.infer(
+                [competition_label()],
+                "BGP邻接状态改变",
+                Path(root) / "second",
+            )
 
-            self.assertEqual(factory.calls, 1)
-            self.assertEqual(first[0]["status"], "success")
-            self.assertEqual(second[0]["status"], "success")
-            self.assertEqual(len(first[0]["reasoner_outputs"]), 3)
+            self.assertIs(engine.llm, engine_instance.llm)
+            self.assertIn("predicted_list", first[0])
+            self.assertIn("rank", second[0])
             self.assertTrue(
                 (Path(root) / "first" / "competition" / "results.json").exists()
             )
 
     def test_cooperation_stops_on_marker_and_saves_rounds(self):
         marker = '["(上一轮次已经符合要求)"]'
-        factory = CountingFactory([
+        engine_instance = fake_engine([
             "meta-round-0",
             "reasoner-round-0",
             f'meta-round-1 {marker}\n["链路故障", "配置错误"]',
         ])
         with tempfile.TemporaryDirectory() as root:
             engine = CooperationInference(
-                "fake-model",
-                alarm_type="BGP邻接状态改变",
+                engine_instance,
                 max_rounds=5,
-                llm_factory=factory,
                 sampling_params_factory=fake_sampling_params,
             )
-            results = engine.infer([cooperation_label()], root)
+            results = engine.infer(
+                [cooperation_label()], "BGP邻接状态改变", root,
+            )
 
-            self.assertEqual(factory.calls, 1)
-            self.assertEqual(results[0]["status"], "success")
-            self.assertTrue(results[0]["early_stopped"])
-            self.assertEqual(results[0]["round_count"], 2)
-            self.assertEqual(len(results[0]["rounds"]), 2)
-            self.assertIsNone(results[0]["rounds"][1]["reasoner_output"])
             self.assertEqual(results[0]["predicted_list"], [
                 "链路故障", "配置错误",
             ])
@@ -166,39 +210,35 @@ class LlmInterfaceTests(unittest.TestCase):
     def test_sop_is_read_only_from_semantic_labels(self):
         label = cooperation_label()
         label["sop"] = "顶层 SOP 不应参与路由"
-        factory = CountingFactory(['["(上一轮次已经符合要求)"]'])
+        engine_instance = fake_engine(['["(上一轮次已经符合要求)"]'])
         with tempfile.TemporaryDirectory() as root:
             engine = CooperationInference(
-                "fake-model",
-                alarm_type="场景",
+                engine_instance,
                 max_rounds=1,
-                llm_factory=factory,
                 sampling_params_factory=fake_sampling_params,
             )
-            results = engine.infer([label], root)
+            results = engine.infer([label], "场景", root)
 
-        self.assertEqual(results[0]["status"], "success")
+        self.assertEqual(results[0]["incident_type"], "场景")
 
     def test_bad_item_does_not_block_other_items(self):
         bad = competition_label()
         bad["semantic_labels"]["sop"] = ""
-        factory = CountingFactory()
+        engine_instance = fake_engine()
         with tempfile.TemporaryDirectory() as root:
             engine = CompetitionInference(
-                "fake-model",
-                alarm_type="场景",
-                llm_factory=factory,
+                engine_instance,
                 sampling_params_factory=fake_sampling_params,
             )
-            results = engine.infer([bad, competition_label()], root)
+            results = engine.infer([bad, competition_label()], "场景", root)
             payload = json.loads(
                 (Path(root) / "competition" / "results.json").read_text(
                     encoding="utf-8"
                 )
             )
 
-        self.assertEqual(results[0]["status"], "failed")
-        self.assertEqual(results[1]["status"], "success")
+        self.assertEqual(results[0]["predicted_list"], [])
+        self.assertIn("rank", results[1])
         self.assertEqual(payload["summary"]["failed_count"], 1)
         self.assertEqual(payload["summary"]["success_count"], 1)
 
@@ -211,7 +251,7 @@ class LlmInterfaceTests(unittest.TestCase):
         ]
         label["root_cause"] = {"category": "根因6"}
         verifier_response = json.dumps(categories, ensure_ascii=False)
-        factory = CountingFactory([
+        engine_instance = fake_engine([
             "reasoner-1",
             "reasoner-2",
             "reasoner-3",
@@ -220,12 +260,12 @@ class LlmInterfaceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as root:
             engine = CompetitionInference(
-                "fake-model",
-                alarm_type="BGP邻接状态改变",
-                llm_factory=factory,
+                engine_instance,
                 sampling_params_factory=fake_sampling_params,
             )
-            results = engine.infer([label], root)
+            results = engine.infer(
+                [label], "BGP邻接状态改变", root,
+            )
             csv_path = (
                 Path(root)
                 / "competition"
@@ -240,6 +280,17 @@ class LlmInterfaceTests(unittest.TestCase):
         self.assertEqual(results[0]["predicted_list_v1"], categories)
         self.assertIsNone(results[0]["rank"])
         self.assertEqual(results[0]["rank_v1"], 6)
+        self.assertEqual(list(results[0]), [
+            "case_idx",
+            "timestamp",
+            "incident_type",
+            "predicted_list",
+            "groundtruth",
+            "rank",
+            "ttm",
+            "predicted_list_v1",
+            "rank_v1",
+        ])
         self.assertEqual(list(rows[0]), [
             "case_idx",
             "timestamp",

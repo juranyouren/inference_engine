@@ -1,10 +1,19 @@
 """可直接由其他 Python 模块调用的 RCA 大模型推理接口。
 
-导入本包不会加载模型。只有实例化 CompetitionInference 或
-CooperationInference 时，所选择的类才会把模型加载进内存。
+模型由 LLMEngine.get_instance() 首次调用时加载，所有推理类共享该实例。
 """
 
-from .competition import CompetitionInference
-from .cooperation import CooperationInference
+__all__ = ["LLMEngine", "CompetitionInference", "CooperationInference"]
 
-__all__ = ["CompetitionInference", "CooperationInference"]
+
+def __getattr__(name):
+    if name == "LLMEngine":
+        from .llm_engine import LLMEngine
+        return LLMEngine
+    if name == "CompetitionInference":
+        from .competition import CompetitionInference
+        return CompetitionInference
+    if name == "CooperationInference":
+        from .cooperation import CooperationInference
+        return CooperationInference
+    raise AttributeError(name)
