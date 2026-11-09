@@ -1,0 +1,432 @@
+{
+  "alarm_type": "网络设备掉线",
+  "decision_templates": {
+    "step_01": {
+      "condition": "检查设备分区device level 是否为 L1 设备.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.device_info.local_device.device_level"
+      ],
+      "guidance": "依据 device_level 的明确分区或已确认的型号映射判断。只有型号且缺少映射时保留未知。",
+      "result_template": {
+        "diagnostic_clues": [],
+        "condition_met": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "step_02": {
+      "condition": "检查服务器 resource_status是否正常运行.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.device_info.local_server_status"
+      ],
+      "guidance": "仅依据所属服务器的 resource_status 判断，服务器状态对象为空时保留未知。按原文评估条件，在理由中注明正常运行的分支与服务器未运行结论之间的冲突。",
+      "result_template": {
+        "diagnostic_clues": [],
+        "condition_met": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "step_04": {
+      "condition": "检查设备信息sys_running_time,是否掉线(sys_running_time是否存在).",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.command_echo_info.sys_running_time"
+      ],
+      "guidance": "按原文括号中的 sys_running_time 是否存在判断。样例的空对象表示未取得。字段缺失且无法确认原因时保留未知。",
+      "result_template": {
+        "diagnostic_clues": [],
+        "condition_met": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "step_05": {
+      "condition": "检查设备信息告警首次发生时间alarm_time与sys_running_time的差是否小于360000ms（判断设备是否重启）.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.command_echo_info.sys_running_time",
+        "$.alarm_time"
+      ],
+      "guidance": "对齐时间含义与单位后核对严格小于 360000 毫秒的条件。如果差值方向、是否取绝对值或时间字段口径不明确，且会影响判断，保留未知。",
+      "result_template": {
+        "diagnostic_clues": [],
+        "condition_met": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "step_06": {
+      "condition": "检查历史重启命令是否存在（判断是否人为变更导致重启）.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.command_echo_info.other_command_echo[*]"
+      ],
+      "guidance": "寻找时间与设备均匹配的历史 reboot/reload 命令。只有明确完成了相关历史查询且无匹配记录时才填 false。通用命令回显为空不代表专用历史查询无结果，专用查询结果的 case 字段待确认。",
+      "result_template": {
+        "diagnostic_clues": [],
+        "condition_met": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "step_09": {
+      "condition": "检查告警时间前后1分钟接口丢包率 offline_loss_rate 是否超过 100%.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.anomaly_kpi.offline_loss_rate.abnormal_timing_segments[*]",
+        "$.alarm_time"
+      ],
+      "guidance": "统一告警时间和 KPI 时间戳的单位，引用告警前后各 1 分钟内的实际采样值。按原文评估是否严格超过 100%，并在理由中注明与等于 100% 的根因标签之间的冲突。无法将样本定位到该时间窗口时保留未知。",
+      "result_template": {
+        "diagnostic_clues": [],
+        "condition_met": null,
+        "confidence": null,
+        "reason": ""
+      }
+    }
+  },
+  "root_cause_prompts": {
+    "rc_1": {
+      "root_cause": "根因1-本端-服务器未运行",
+      "prompt": "评估模板中的 root_cause，只使用 case 的语义标签和告警时间作为证据。只输出 JSON，包含 decisions 和 conclusion 两个对象。decisions 以 paths 引用的决策 ID 为键，每个节点按 result_template 填写一次。diagnostic_clues 每项记录相关证据的具体 path 和原始 value。condition_met 是实际判断，取 true、false 或 null。required_condition_met 是路径要求。证据缺失、无法解释或冲突时填 null 并说明原因。按 conclusion_template 填写 conclusion。有一条路径的所有节点均匹配时，supported 填 true。每条路径均有明确不匹配的节点时填 false，其余填 null。已判定时 confidence 取 0 到 1，未知时填 null。reason 简述判断依据。",
+      "paths": [
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_02",
+            "required_condition_met": true
+          }
+        ]
+      ],
+      "conclusion_template": {
+        "supported": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "rc_2": {
+      "root_cause": "根因2-本端-设备未掉线",
+      "prompt": "评估模板中的 root_cause，只使用 case 的语义标签和告警时间作为证据。只输出 JSON，包含 decisions 和 conclusion 两个对象。decisions 以 paths 引用的决策 ID 为键，每个节点按 result_template 填写一次。diagnostic_clues 每项记录相关证据的具体 path 和原始 value。condition_met 是实际判断，取 true、false 或 null。required_condition_met 是路径要求。证据缺失、无法解释或冲突时填 null 并说明原因。按 conclusion_template 填写 conclusion。有一条路径的所有节点均匹配时，supported 填 true。每条路径均有明确不匹配的节点时填 false，其余填 null。已判定时 confidence 取 0 到 1，未知时填 null。reason 简述判断依据。",
+      "paths": [
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_02",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_05",
+            "required_condition_met": false
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_05",
+            "required_condition_met": false
+          }
+        ]
+      ],
+      "conclusion_template": {
+        "supported": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "rc_3": {
+      "root_cause": "根因3-本端-设备重启（变更引起）",
+      "prompt": "评估模板中的 root_cause，只使用 case 的语义标签和告警时间作为证据。只输出 JSON，包含 decisions 和 conclusion 两个对象。decisions 以 paths 引用的决策 ID 为键，每个节点按 result_template 填写一次。diagnostic_clues 每项记录相关证据的具体 path 和原始 value。condition_met 是实际判断，取 true、false 或 null。required_condition_met 是路径要求。证据缺失、无法解释或冲突时填 null 并说明原因。按 conclusion_template 填写 conclusion。有一条路径的所有节点均匹配时，supported 填 true。每条路径均有明确不匹配的节点时填 false，其余填 null。已判定时 confidence 取 0 到 1，未知时填 null。reason 简述判断依据。",
+      "paths": [
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_02",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_05",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": true
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_02",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": true
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_05",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": true
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": true
+          }
+        ]
+      ],
+      "conclusion_template": {
+        "supported": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "rc_4": {
+      "root_cause": "根因4-本端-设备丢包率=100%",
+      "prompt": "评估模板中的 root_cause，只使用 case 的语义标签和告警时间作为证据。只输出 JSON，包含 decisions 和 conclusion 两个对象。decisions 以 paths 引用的决策 ID 为键，每个节点按 result_template 填写一次。diagnostic_clues 每项记录相关证据的具体 path 和原始 value。condition_met 是实际判断，取 true、false 或 null。required_condition_met 是路径要求。证据缺失、无法解释或冲突时填 null 并说明原因。按 conclusion_template 填写 conclusion。有一条路径的所有节点均匹配时，supported 填 true。每条路径均有明确不匹配的节点时填 false，其余填 null。已判定时 confidence 取 0 到 1，未知时填 null。reason 简述判断依据。",
+      "paths": [
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_02",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_05",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_09",
+            "required_condition_met": true
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_02",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_09",
+            "required_condition_met": true
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_05",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_09",
+            "required_condition_met": true
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_09",
+            "required_condition_met": true
+          }
+        ]
+      ],
+      "conclusion_template": {
+        "supported": null,
+        "confidence": null,
+        "reason": ""
+      }
+    },
+    "rc_5": {
+      "root_cause": "根因5-本端-设备丢包率<100%",
+      "prompt": "评估模板中的 root_cause，只使用 case 的语义标签和告警时间作为证据。只输出 JSON，包含 decisions 和 conclusion 两个对象。decisions 以 paths 引用的决策 ID 为键，每个节点按 result_template 填写一次。diagnostic_clues 每项记录相关证据的具体 path 和原始 value。condition_met 是实际判断，取 true、false 或 null。required_condition_met 是路径要求。证据缺失、无法解释或冲突时填 null 并说明原因。按 conclusion_template 填写 conclusion。有一条路径的所有节点均匹配时，supported 填 true。每条路径均有明确不匹配的节点时填 false，其余填 null。已判定时 confidence 取 0 到 1，未知时填 null。reason 简述判断依据。",
+      "paths": [
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_02",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_05",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_09",
+            "required_condition_met": false
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_02",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_09",
+            "required_condition_met": false
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_05",
+            "required_condition_met": true
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_09",
+            "required_condition_met": false
+          }
+        ],
+        [
+          {
+            "decision_id": "step_01",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_04",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_06",
+            "required_condition_met": false
+          },
+          {
+            "decision_id": "step_09",
+            "required_condition_met": false
+          }
+        ]
+      ],
+      "conclusion_template": {
+        "supported": null,
+        "confidence": null,
+        "reason": ""
+      }
+    }
+  }
+}

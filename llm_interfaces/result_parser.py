@@ -103,6 +103,17 @@ def _rank(groundtruth: str, prediction: Sequence[str]):
     return None
 
 
+def prediction_fields(ranking: List[str], groundtruth: str, strategy: str) -> Dict[str, Any]:
+    top_five = ranking[:5]
+    return {
+        "predicted_list": top_five,
+        "rank": _rank(groundtruth, top_five),
+        "predicted_list_v1": ranking,
+        "rank_v1": _rank(groundtruth, ranking),
+        "parse_strategy": strategy,
+    }
+
+
 def build_prediction_fields(
     response_text: str,
     root_cause_candidates: Any,
@@ -112,11 +123,4 @@ def build_prediction_fields(
     full_prediction, strategy = extract_ranked_categories(
         response_text, candidates,
     )
-    top_five = full_prediction[:5]
-    return {
-        "predicted_list": top_five,
-        "rank": _rank(groundtruth, top_five),
-        "predicted_list_v1": full_prediction,
-        "rank_v1": _rank(groundtruth, full_prediction),
-        "parse_strategy": strategy,
-    }
+    return prediction_fields(full_prediction, groundtruth, strategy)

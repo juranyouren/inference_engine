@@ -28,28 +28,26 @@ def _sop_to_text(value: Any) -> str:
         return ""
     if isinstance(value, str):
         return value.strip()
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return "\n".join(value).strip()
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False) if value else ""
     return str(value).strip()
 
 
-def _root_cause_candidates(label: Dict[str, Any]) -> Any:
-    candidates = label.get("root_cause_candidates", [])
-    if candidates:
-        return candidates
-
-    root_cause = label.get("root_cause", "")
-    if isinstance(root_cause, dict):
-        root_cause = (
-            root_cause.get("category", "")
-            or root_cause.get("name", "")
-            or root_cause.get("root_cause", "")
-        )
-    return [root_cause] if root_cause else []
+def read_sop(label: Dict[str, Any]) -> str:
+    labels = label.get("semantic_labels")
+    return _sop_to_text(labels.get("sop")) if isinstance(labels, dict) else ""
 
 
-def _groundtruth(label: Dict[str, Any]) -> str:
-    root_cause = label.get("root_cause", "")
+def without_sop(label: Dict[str, Any]) -> Dict[str, Any]:
+    labels = label.get("semantic_labels")
+    if not isinstance(labels, dict):
+        return label
+    return {**label, "semantic_labels": {key: value for key, value in labels.items() if key != "sop"}}
+
+
+def _root_cause_name(root_cause: Any) -> str:
     if isinstance(root_cause, dict):
         root_cause = (
             root_cause.get("category", "")
@@ -57,6 +55,15 @@ def _groundtruth(label: Dict[str, Any]) -> str:
             or root_cause.get("root_cause", "")
         )
     return str(root_cause).strip() if root_cause is not None else ""
+
+
+def groundtruth_category(label: Dict[str, Any]) -> str:
+    labels = label.get("semantic_labels")
+    if isinstance(labels, dict):
+        category = _root_cause_name(labels.get("root_cause"))
+        if category:
+            return category
+    return _root_cause_name(label.get("root_cause"))
 
 
 def _case_id(label: Dict[str, Any], input_index: int) -> str:
@@ -93,7 +100,7 @@ def normalize_case(
     if not alarm_type or not str(alarm_type).strip():
         raise ValueError("alarm_type 不能为空")
 
-    sop = _sop_to_text(semantic_labels.get("sop"))
+    sop = read_sop(label)
     if mode == "competition" and not sop:
         raise ValueError(
             f"input_list[{input_index}] 的 semantic_labels.sop 为空，"
@@ -113,20 +120,12 @@ def normalize_case(
             "alarm_time",
             semantic_labels.get("alarm_time", ""),
         ),
-        semantic_labels=semantic_labels,
+        semantic_labels={
+            key: value for key, value in semantic_labels.items()
+            if key not in {"sop", "root_cause"}
+        },
         sop=sop,
-        root_cause_candidates=_root_cause_candidates(label),
-        groundtruth=_groundtruth(label),
+        root_cause_candidates=label.get("root_cause_candidates") or [],
+        groundtruth=groundtruth_category(label),
         ttm=label.get("ttm", semantic_labels.get("ttm")),
-    )
-
-
-def truncate_history(text: str, max_chars: int) -> str:
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-    half = max_chars // 2
-    return (
-        text[:half]
-        + "\n\n[...输出过长，中间部分已截断...]\n\n"
-        + text[-half:]
     )

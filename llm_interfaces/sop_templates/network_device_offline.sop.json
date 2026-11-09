@@ -1,0 +1,74 @@
+{
+  "alarm_type": "网络设备掉线",
+  "source": {
+    "status": "待审核",
+    "primary": "用户提供的四条告警 label 中第 4 条的顶层 sop，包含 Procedure 1 至 Procedure 11。",
+    "review_notes": [
+      "四条样例的 sop 都在 label 顶层。仓库的运行时分流按约定读取 semantic_labels.sop。",
+      "Procedure 2 按原文保留：服务器状态正常走 Yes，指向 Procedure 3 的服务器未运行结论。条件与根因名称存在冲突。",
+      "Procedure 5 的阈值是小于 360000ms（6 分钟）。原文未明确差值方向及是否取绝对值。",
+      "Procedure 9 按原文保留：告警前后 1 分钟内超过 100% 走 Yes，指向 Procedure 10 的丢包率=100% 结论。同一条样例的实际采样最高为 100%，script_cots 写的是 >=100% 并走到 Procedure 10。",
+      "样例只有设备型号、空的服务器状态对象和通用命令回显占位项。L1 的型号映射、服务器 resource_status 和专用重启历史记录的字段绑定仍待核对。"
+    ]
+  },
+  "entry": "step_01",
+  "decisions": {
+    "step_01": {
+      "condition": "检查设备分区device level 是否为 L1 设备.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.device_info.local_device.device_level"
+      ],
+      "guidance": "依据 device_level 的明确分区或已确认的型号映射判断。只有型号且缺少映射时保留未知。",
+      "branches": {"true": "step_02", "false": "step_04"}
+    },
+    "step_02": {
+      "condition": "检查服务器 resource_status是否正常运行.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.device_info.local_server_status"
+      ],
+      "guidance": "仅依据所属服务器的 resource_status 判断，服务器状态对象为空时保留未知。按原文评估条件，在理由中注明正常运行的分支与服务器未运行结论之间的冲突。",
+      "branches": {"true": "rc_1", "false": "step_04"}
+    },
+    "step_04": {
+      "condition": "检查设备信息sys_running_time,是否掉线(sys_running_time是否存在).",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.command_echo_info.sys_running_time"
+      ],
+      "guidance": "按原文括号中的 sys_running_time 是否存在判断。样例的空对象表示未取得。字段缺失且无法确认原因时保留未知。",
+      "branches": {"true": "step_05", "false": "step_06"}
+    },
+    "step_05": {
+      "condition": "检查设备信息告警首次发生时间alarm_time与sys_running_time的差是否小于360000ms（判断设备是否重启）.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.command_echo_info.sys_running_time",
+        "$.alarm_time"
+      ],
+      "guidance": "对齐时间含义与单位后核对严格小于 360000 毫秒的条件。如果差值方向、是否取绝对值或时间字段口径不明确，且会影响判断，保留未知。",
+      "branches": {"true": "step_06", "false": "rc_2"}
+    },
+    "step_06": {
+      "condition": "检查历史重启命令是否存在（判断是否人为变更导致重启）.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.other_info.command_echo_info.other_command_echo[*]"
+      ],
+      "guidance": "寻找时间与设备均匹配的历史 reboot/reload 命令。只有明确完成了相关历史查询且无匹配记录时才填 false。通用命令回显为空不代表专用历史查询无结果，专用查询结果的 case 字段待确认。",
+      "branches": {"true": "rc_3", "false": "step_09"}
+    },
+    "step_09": {
+      "condition": "检查告警时间前后1分钟接口丢包率 offline_loss_rate 是否超过 100%.",
+      "diagnostic_clue_paths": [
+        "$.semantic_labels.anomaly_kpi.offline_loss_rate.abnormal_timing_segments[*]",
+        "$.alarm_time"
+      ],
+      "guidance": "统一告警时间和 KPI 时间戳的单位，引用告警前后各 1 分钟内的实际采样值。按原文评估是否严格超过 100%，并在理由中注明与等于 100% 的根因标签之间的冲突。无法将样本定位到该时间窗口时保留未知。",
+      "branches": {"true": "rc_4", "false": "rc_5"}
+    }
+  },
+  "root_causes": {
+    "rc_1": "根因1-本端-服务器未运行",
+    "rc_2": "根因2-本端-设备未掉线",
+    "rc_3": "根因3-本端-设备重启（变更引起）",
+    "rc_4": "根因4-本端-设备丢包率=100%",
+    "rc_5": "根因5-本端-设备丢包率<100%"
+  }
+}

@@ -1,348 +1,164 @@
-"""Cooperation 模式的可复用 Python 接口。"""
+"""合作型 Orchestrator、三位专家、意见池与 Aggregator。"""
 
 from __future__ import annotations
 
-import threading
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
-
-from .data_adapter import InferenceCase, normalize_case, truncate_history
-from .generator import RCAGenerator
-from .io_utils import (
-    case_output_dir,
-    category_output_dir,
-    csv_result_dict,
-    ensure_dir,
-    iter_batches,
-    save_batch_results,
-    save_category_csvs,
-    save_case_result,
-    save_text,
+from .agent_runner import (
+    AgentInference, case_evidence, final_text, response_json, validate_ranking,
 )
-from .result_parser import build_prediction_fields
+from .result_parser import candidate_categories
 
 
-EARLY_STOP_MARKER = '["(上一轮次已经符合要求)"]'
+SPECIALISTS = {
+    "log": ("log_data", "日志专家。核对告警日志、事件和命令日志的时序关系。"),
+    "time_series": ("time_series_data", "时序专家。核对 KPI、异常流量、时间窗口及阈值。"),
+    "metadata": ("metadata", "元数据专家。核对设备、接口、拓扑和命令回显。"),
+}
+ORCHESTRATOR_PROMPT = (
+    "你是 Orchestrator。把 case.semantic_labels 的每个顶层字段分配给一位专家。"
+    "只返回 JSON 对象，键为 log_data、time_series_data、metadata，值为字段名列表。"
+    "每个字段恰好分配一次，允许空列表。anomaly_logs 给日志专家，anomaly_kpi 和 "
+    "anomaly_netstreams 给时序专家，other_info 给元数据专家。"
+)
+OPINION_PROMPT = (
+    '只输出 JSON 对象 {"reasoning_chain":["证据 → 诊断判断"],"root_cause":"根因名称"}。'
+    "简述可核查的证据和诊断依据，并标注缺失证据。候选列表非空时从中选择根因。"
+)
+REVIEW_PROMPT = (
+    "审阅同一轮收到的意见池及你的原始证据。有新增证据、修正或不同结论时提交新意见。"
+    "无需补充时只输出 NO COMMENT。"
+)
+AGGREGATOR_PROMPT = (
+    '你是 Aggregator。综合意见池中的证据与分歧，输出 JSON 对象 '
+    '{"ranking":["最可能根因","其他根因"],"reason":"主要依据和不确定性"}。'
+    "若提供候选列表，按可能性排列全部候选，每项恰好一次。"
+)
 
 
-class CooperationInference:
-    """Cooperation（多轮 Meta/Reasoner）推理接口。
+class CooperationInference(AgentInference):
+    """专家的初评与复评共享意见池，结束后由 Aggregator 汇总。"""
 
-    模型由调用方传入的 LLMEngine 持有，本类不会加载模型。
-    """
+    mode = "cooperation"
 
     def __init__(
-        self,
-        engine: Any,
-        *,
-        batch_size: int = 8,
-        max_rounds: int = 5,
-        history_max_chars: int = 9000,
-        max_tokens: int = 4096,
-        prompt_safety_tokens: int = 512,
-        sampling_params_factory: Optional[Callable[..., Any]] = None,
-    ) -> None:
-        if max_rounds <= 0:
-            raise ValueError("max_rounds 必须大于 0")
-        if history_max_chars <= 0:
-            raise ValueError("history_max_chars 必须大于 0")
+        self, engine, *, invoke_limit=10, max_rounds=None, **kwargs,
+    ):
+        if type(invoke_limit) is not int or invoke_limit < 5:
+            raise ValueError("invoke_limit 必须为至少 5 的整数")
+        if max_rounds is not None:
+            if type(max_rounds) is not int or max_rounds <= 0:
+                raise ValueError("max_rounds 必须为正整数")
+            invoke_limit = min(invoke_limit, 5 + 3 * max_rounds)
+        self.invoke_limit = invoke_limit
+        super().__init__(engine, **kwargs)
 
-        self.engine = engine
-        self.batch_size = batch_size
-        self.max_rounds = max_rounds
-        self.history_max_chars = history_max_chars
-        self._infer_lock = threading.Lock()
+    @staticmethod
+    def _route(response, labels):
+        routes = response_json(response)
+        expected = {group for group, _prompt in SPECIALISTS.values()}
+        if not isinstance(routes, dict) or routes.keys() != expected:
+            raise ValueError("Orchestrator 必须返回三组字段")
+        fields = []
+        for keys in routes.values():
+            if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+                raise ValueError("Orchestrator 分组必须是字段名列表")
+            fields.extend(keys)
+        if sorted(fields) != sorted(labels):
+            raise ValueError("Orchestrator 必须把每个实际字段恰好分配一次")
+        for field, group in (
+            ("anomaly_logs", "log_data"), ("anomaly_kpi", "time_series_data"),
+            ("anomaly_netstreams", "time_series_data"), ("other_info", "metadata"),
+        ):
+            if field in labels and field not in routes[group]:
+                raise ValueError(f"Orchestrator 将 {field} 分配到了错误的专家")
+        return routes
 
-        self.generator = RCAGenerator(
-            engine,
-            batch_size=batch_size,
-            max_tokens=max_tokens,
-            prompt_safety_tokens=prompt_safety_tokens,
-            sampling_params_factory=sampling_params_factory,
+    @staticmethod
+    def _opinion(response, candidates, role, round_index):
+        opinion = response_json(response)
+        if not isinstance(opinion, dict):
+            raise ValueError(f"{role} 专家的意见必须为 JSON 对象")
+        chain = opinion.get("reasoning_chain")
+        cause = opinion.get("root_cause")
+        if not isinstance(chain, list) or not chain or any(
+            not isinstance(item, str) or not item.strip() for item in chain
+        ):
+            raise ValueError(f"{role} 专家的 reasoning_chain 必须为非空字符串列表")
+        if not isinstance(cause, str) or not cause.strip() or (candidates and cause not in candidates):
+            raise ValueError(f"{role} 专家返回了无效的根因")
+        return {"agent": role, "round": round_index, "reasoning_chain": chain, "root_cause": cause}
+
+    def _infer_case(self, case, output_dir, result):
+        evidence = case_evidence(case)
+        candidates = candidate_categories(case.root_cause_candidates)
+        context = {
+            "alarm_type": case.alarm_type, "alarm_time": case.alarm_time,
+            "root_cause_candidates": candidates,
+        }
+        pool = []
+        result.update(
+            opinion_pool=pool, invoke_limit=self.invoke_limit, agent_invocations=0,
+            round_count=0, early_stopped=False, rounds=[],
         )
-        self.llm = self.generator.llm
 
-    @staticmethod
-    def _new_result(
-        *,
-        input_index: int,
-        case_id: str,
-        output_dir: Path,
-    ) -> Dict[str, Any]:
-        return {
-            "input_index": input_index,
-            "case_idx": input_index,
-            "case_id": case_id,
-            "mode": "cooperation",
-            "status": "pending",
-            "output_dir": str(output_dir.resolve()),
-            "timestamp": None,
-            "incident_type": None,
-            "groundtruth": "",
-            "rank": None,
-            "ttm": None,
-            "predicted_list": [],
-            "predicted_list_v1": [],
-            "rank_v1": None,
-            "parse_strategy": "unparsed",
-            "round_count": 0,
-            "early_stopped": False,
-            "rounds": [],
-            "final_result": None,
-            "last_reasoner_output": None,
-            "error": None,
+        def invoke(requests):
+            result["agent_invocations"] += len(requests)
+            return self.generator.generate(requests, output_dir)
+
+        routed, = invoke([("orchestrator", ORCHESTRATOR_PROMPT, {"case": evidence})])
+        labels = evidence["semantic_labels"]
+        routes = self._route(routed, labels)
+        result["routes"] = routes
+        specialist_data = {
+            role: {**context, group: {key: labels[key] for key in routes[group]}}
+            for role, (group, _prompt) in SPECIALISTS.items()
         }
 
-    @staticmethod
-    def _fail(result: Dict[str, Any], error: Exception | str) -> None:
-        result["status"] = "failed"
-        result["error"] = str(error)
-        save_case_result(result)
+        roles = list(SPECIALISTS)
+        initial = invoke([
+            (f"round0/{role}", SPECIALISTS[role][1] + OPINION_PROMPT, specialist_data[role])
+            for role in roles
+        ])
+        pool.extend(self._opinion(answer, candidates, role, 0) for role, answer in zip(roles, initial))
+        result["rounds"].append({"round": 0, "commented": roles, "no_comment": []})
+        result["round_count"] = 1
 
-    @staticmethod
-    def _succeed(
-        result: Dict[str, Any],
-        case: InferenceCase,
-        response: str,
-    ) -> None:
-        result["status"] = "success"
-        result["final_result"] = response
-        result.update(build_prediction_fields(
-            response,
-            case.root_cause_candidates,
-            case.groundtruth,
-        ))
-        result["error"] = None
-        save_case_result(result)
-
-    def _last_round_outputs(self, state: Dict[str, Any]) -> str:
-        last_meta = state.get("last_meta")
-        last_reasoner = state.get("last_reasoner")
-        if last_meta is None and last_reasoner is None:
-            return "无上一轮输出。"
-
-        sections = []
-        if last_meta is not None:
-            sections.append(
-                "[Last Meta]\n"
-                + truncate_history(last_meta, self.history_max_chars)
-            )
-        if last_reasoner is not None:
-            sections.append(
-                "[Last Reasoner]\n"
-                + truncate_history(last_reasoner, self.history_max_chars)
-            )
-        return "\n\n".join(sections)
-
-    @staticmethod
-    def _meta_data(
-        case: InferenceCase,
-        last_round_outputs: str,
-    ) -> Dict[str, Any]:
-        return {
-            "Last_round_outputs": last_round_outputs,
-            "alarm_type": case.alarm_type,
-            "semantic_labels_key": case.semantic_labels,
-            "sop": "",
-            "root_cause_candidates": case.root_cause_candidates,
-        }
-
-    @staticmethod
-    def _reasoner_data(
-        case: InferenceCase,
-        meta_output: str,
-    ) -> Dict[str, Any]:
-        return {
-            "meta_output": meta_output,
-            "alarm_type": case.alarm_type,
-            "alarm_time": case.alarm_time,
-            "semantic_labels": case.semantic_labels,
-            "root_cause_candidates": case.root_cause_candidates,
-        }
-
-    def infer(
-        self,
-        input_list: List[Dict[str, Any]],
-        alarm_type: str,
-        output_dir: str | Path = "res",
-    ) -> List[Dict[str, Any]]:
-        """按给定告警类别执行多轮推理并返回 CSV 对应结果。"""
-        if not isinstance(input_list, list):
-            raise TypeError("input_list 必须是列表")
-        if not alarm_type or not str(alarm_type).strip():
-            raise ValueError("alarm_type 不能为空")
-
-        with self._infer_lock:
-            return self._infer(input_list, str(alarm_type), output_dir)
-
-    def _infer(
-        self,
-        input_list: List[Dict[str, Any]],
-        alarm_type: str,
-        output_dir: str | Path,
-    ) -> List[Dict[str, Any]]:
-        output_root = ensure_dir(Path(output_dir) / "cooperation")
-        results: List[Dict[str, Any]] = []
-        valid_items: List[tuple[InferenceCase, Dict[str, Any]]] = []
-
-        for input_index, label in enumerate(input_list):
-            current_output_dir = case_output_dir(
-                category_output_dir(output_root, alarm_type),
-                input_index,
-            )
-            raw_case_id = (
-                str(label.get("case_id", label.get("id", input_index)))
-                if isinstance(label, dict)
-                else str(input_index)
-            )
-            result = self._new_result(
-                input_index=input_index,
-                case_id=raw_case_id,
-                output_dir=current_output_dir,
-            )
-            result["incident_type"] = alarm_type
-            if isinstance(label, dict):
-                result["timestamp"] = label.get("alarm_time")
-            results.append(result)
-            try:
-                case = normalize_case(
-                    label,
-                    input_index=input_index,
-                    mode="cooperation",
-                    alarm_type=alarm_type,
+        while result["agent_invocations"] < self.invoke_limit - 1:
+            remaining = self.invoke_limit - result["agent_invocations"] - 1
+            active = roles[:remaining]
+            round_index = result["round_count"]
+            snapshot = list(pool)
+            answers = invoke([
+                (
+                    f"round{round_index}/{role}",
+                    SPECIALISTS[role][1] + REVIEW_PROMPT + OPINION_PROMPT,
+                    {**specialist_data[role], "opinion_pool": snapshot},
                 )
-                result["case_id"] = case.case_id
-                result["timestamp"] = case.alarm_time
-                result["incident_type"] = case.alarm_type
-                result["groundtruth"] = case.groundtruth
-                result["ttm"] = case.ttm
-                valid_items.append((case, result))
-            except (TypeError, ValueError) as exc:
-                self._fail(result, exc)
+                for role in active
+            ])
+            no_comment = []
+            new_opinions = []
+            for role, answer in zip(active, answers):
+                if final_text(answer) == "NO COMMENT":
+                    no_comment.append(role)
+                else:
+                    new_opinions.append(self._opinion(answer, candidates, role, round_index))
+            pool.extend(new_opinions)
+            result["rounds"].append({
+                "round": round_index, "commented": [item["agent"] for item in new_opinions],
+                "no_comment": no_comment,
+            })
+            result["round_count"] += 1
+            if len(no_comment) == len(roles):
+                result["early_stopped"] = True
+                break
 
-        for batch in iter_batches(valid_items, self.batch_size):
-            states = [
-                {
-                    "case": case,
-                    "result": result,
-                    "last_meta": None,
-                    "last_reasoner": None,
-                    "done": False,
-                }
-                for case, result in batch
-            ]
-
-            for round_index in range(self.max_rounds):
-                active = [state for state in states if not state["done"]]
-                if not active:
-                    break
-
-                meta_dirs = [
-                    ensure_dir(
-                        Path(state["result"]["output_dir"])
-                        / f"round{round_index}"
-                        / "meta"
-                    )
-                    for state in active
-                ]
-                meta_data = [
-                    self._meta_data(
-                        state["case"], self._last_round_outputs(state),
-                    )
-                    for state in active
-                ]
-
-                try:
-                    meta_responses = self.generator.generate_cooperation_meta(
-                        meta_data, meta_dirs,
-                    )
-                except Exception as exc:
-                    for state in active:
-                        self._fail(
-                            state["result"],
-                            f"Cooperation Meta 推理失败: {exc}",
-                        )
-                        state["done"] = True
-                    break
-
-                reasoner_states = []
-                reasoner_data = []
-                reasoner_dirs = []
-                for state, meta_dir, meta_response in zip(
-                    active, meta_dirs, meta_responses,
-                ):
-                    save_text(meta_response, meta_dir / "raw_responses.txt")
-                    state["last_meta"] = meta_response
-                    state["result"]["rounds"].append({
-                        "round": round_index,
-                        "meta_output": meta_response,
-                        "reasoner_output": None,
-                    })
-                    state["result"]["round_count"] = round_index + 1
-
-                    if EARLY_STOP_MARKER in meta_response:
-                        state["result"]["early_stopped"] = True
-                        state["done"] = True
-                        self._succeed(
-                            state["result"], state["case"], meta_response,
-                        )
-                        continue
-
-                    reasoner_states.append(state)
-                    reasoner_data.append(
-                        self._reasoner_data(state["case"], meta_response)
-                    )
-                    reasoner_dirs.append(
-                        ensure_dir(
-                            Path(state["result"]["output_dir"])
-                            / f"round{round_index}"
-                            / "reasoner"
-                        )
-                    )
-
-                if not reasoner_states:
-                    continue
-
-                try:
-                    reasoner_responses = (
-                        self.generator.generate_cooperation_reasoner(
-                            reasoner_data, reasoner_dirs,
-                        )
-                    )
-                except Exception as exc:
-                    for state in reasoner_states:
-                        self._fail(
-                            state["result"],
-                            f"Cooperation Reasoner 推理失败: {exc}",
-                        )
-                        state["done"] = True
-                    continue
-
-                for state, reasoner_dir, reasoner_response in zip(
-                    reasoner_states, reasoner_dirs, reasoner_responses,
-                ):
-                    save_text(
-                        reasoner_response,
-                        reasoner_dir / "raw_responses.txt",
-                    )
-                    state["last_reasoner"] = reasoner_response
-                    state["result"]["last_reasoner_output"] = reasoner_response
-                    state["result"]["rounds"][-1][
-                        "reasoner_output"
-                    ] = reasoner_response
-
-            for state in states:
-                result = state["result"]
-                if result["status"] == "pending":
-                    # Meta 输出包含根因排序；Reasoner 输出是供下一轮 Meta 使用的分析。
-                    self._succeed(
-                        result, state["case"], state["last_meta"] or "",
-                    )
-
-        save_batch_results(
-            mode="cooperation",
-            output_dir=output_root,
-            results=results,
-        )
-        save_category_csvs(output_root, results)
-        return [csv_result_dict(result) for result in results]
+        result["stop_reason"] = "all_no_comment" if result["early_stopped"] else "invoke_limit"
+        answer, = invoke([
+            ("aggregator", AGGREGATOR_PROMPT, {**context, "opinion_pool": pool}),
+        ])
+        result["final_result"] = answer
+        conclusion = response_json(answer)
+        if not isinstance(conclusion, dict) or not isinstance(conclusion.get("reason"), str):
+            raise ValueError("Aggregator 必须返回 ranking 和 reason")
+        result["conclusion"] = conclusion
+        return validate_ranking(conclusion.get("ranking"), candidates)

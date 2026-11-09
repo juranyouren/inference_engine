@@ -19,6 +19,7 @@ from bian_reproduction.prompts import (
     ANOMALY_ANALYSIS_PROMPT,
     JOINT_SCORING_PROMPT,
 )
+from utils.public_functions import semantic_labels_for_prompt
 
 
 def _json_text(value: Any) -> str:
@@ -81,10 +82,10 @@ def load_record(label_path: Path, alarm_type: str) -> Dict[str, Any]:
     return {
         "alarm_type": alarm_type,
         "alarm_time": label.get("alarm_time", semantic_labels.get("alarm_time", "")),
-        "semantic_labels": semantic_labels,
+        "semantic_labels": semantic_labels_for_prompt(semantic_labels),
         "sop": _sop(label, semantic_labels),
         "root_cause_candidates": candidates,
-        "root_cause": _root_cause(label.get("root_cause", "")),
+        "root_cause": _root_cause(semantic_labels.get("root_cause")) or _root_cause(label.get("root_cause")),
         "label_file_path": str(label_path.resolve()),
     }
 

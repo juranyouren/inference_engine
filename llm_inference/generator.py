@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 from vllm import LLM, SamplingParams
-from utils.public_functions import vllm_invoke, save_json
+from utils.public_functions import semantic_labels_for_prompt, vllm_invoke, save_json
 from llm_inference.prompts import (
     ROOT_CAUSE_META, ROOT_CAUSE_Meta_thinker, ROOT_CAUSE_Reasoner,
     ROOT_CAUSE_Reasoner1, ROOT_CAUSE_Verifier,
@@ -33,6 +33,7 @@ class RCAGenerator:
     @staticmethod
     def _filter_semantic_labels_for_prompt(alarm_type, semantic_labels):
         """对于入方向带宽利用率过高，不把日志(anomaly_logs)放进prompt。"""
+        semantic_labels = semantic_labels_for_prompt(semantic_labels)
         if alarm_type == "入方向带宽利用率过高":
             filtered = dict(semantic_labels)
             if "anomaly_logs" in filtered:
@@ -154,7 +155,10 @@ class RCAGenerator:
             input_prompt = ROOT_CAUSE_Meta_thinker.format(
                 Last_round_outputs=alarm_data['Last_round_outputs'],
                 alarm_type=alarm_data['alarm_type'],
-                semantic_labels_key=json.dumps(alarm_data['semantic_labels_key'], ensure_ascii=False, indent=2),
+                semantic_labels_key=json.dumps(
+                    semantic_labels_for_prompt(alarm_data['semantic_labels_key']),
+                    ensure_ascii=False, indent=2,
+                ),
                 sop=alarm_data['sop'],
                 # sop="",
                 root_cause_candidates=json.dumps(alarm_data['root_cause_candidates'], ensure_ascii=False, indent=2)
@@ -369,7 +373,10 @@ class RCAGenerator:
             input_prompt = ROOT_CAUSE_Meta_thinker_Coopetition.format(
                 Last_round_outputs=alarm_data['Last_round_outputs'],
                 alarm_type=alarm_data['alarm_type'],
-                semantic_labels_key=json.dumps(alarm_data['semantic_labels_key'], ensure_ascii=False, indent=2),
+                semantic_labels_key=json.dumps(
+                    semantic_labels_for_prompt(alarm_data['semantic_labels_key']),
+                    ensure_ascii=False, indent=2,
+                ),
                 sop=alarm_data['sop'],
                 # sop="",
                 root_cause_candidates=json.dumps(alarm_data['root_cause_candidates'], ensure_ascii=False, indent=2)

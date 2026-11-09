@@ -71,7 +71,7 @@ DEFAULT_LLM_MODE = "auto"
 # LLM 使用完整推理流程。
 LLM_META_ONLY = False
 
-# Cooperation 最大 Meta/Reasoner 迭代轮数。
+# 兼容的合作型复评轮数上限，总调用次数仍受 --invoke-limit 约束。
 LLM_COOPERATION_MAX_ROUNDS = 5
 
 

@@ -194,15 +194,20 @@ def vllm_invoke(
     batch_size: int,
     prompt_safety_tokens: int,
     prompt_output_paths: Optional[List[str | Path]] = None,
+    require_complete_input: bool = False,
 ) -> List[str]:
     if not inputs:
         return []
     if batch_size <= 0:
         raise ValueError("batch_size 必须大于 0")
 
-    fitted_inputs, _stats = fit_vllm_inputs(
+    fitted_inputs, stats = fit_vllm_inputs(
         llm, inputs, sampling_params, prompt_safety_tokens,
     )
+    if require_complete_input and any(
+        item["truncation_strategy"] == "whole_prompt_fallback" for item in stats
+    ):
+        raise ValueError("压缩日志后 Agent 输入仍超出模型预算，无法保留完整的结构化输入")
     if prompt_output_paths is not None:
         if len(prompt_output_paths) != len(fitted_inputs):
             raise ValueError("prompt 输出路径数量必须与输入数量一致")

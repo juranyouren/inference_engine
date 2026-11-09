@@ -71,9 +71,11 @@ def _infer_one_case(
     alarm_type: str,
     output_dir: str,
 ) -> None:
-    results = inference.infer([label], alarm_type, output_dir)
+    results = inference.infer_results([label], alarm_type, output_dir)
     if not results:
         raise RuntimeError(f"{mode} 单 case 推理未返回结果")
+    if results[0]["status"] != "success":
+        raise RuntimeError(f"{mode} 单 case 推理失败: {results[0]['error']}")
 
     print(
         f"[{mode}] 推理完成，case_idx={results[0].get('case_idx')}，"
