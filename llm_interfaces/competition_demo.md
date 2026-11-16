@@ -38,7 +38,7 @@
 
 ## 2. 各 Agent 填写决策与结论
 
-该 Agent 根据 `device_level` 判断 `step_01` 不成立。`step_02` 缺少服务器状态，填 `null`。由于唯一候选路径已有一个明确不匹配的条件，`supported` 填 `false`。
+该 Agent 为每个节点报告检查状态。`step_01` 的实际设备分区是 L2，填 `false`。`step_02` 缺少服务器状态，填 `null`。该根因路径支持度较低，Agent 给出一个较低的分支置信度，供 Verifier 复核。
 
 ```json
 {
@@ -57,8 +57,7 @@
     }
   },
   "conclusion": {
-    "supported": false,
-    "confidence": 0.95,
+    "confidence": 0.05,
     "reason": "唯一候选路径要求设备属于 L1，实际为 L2。"
   }
 }

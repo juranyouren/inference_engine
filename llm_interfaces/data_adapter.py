@@ -21,6 +21,7 @@ class InferenceCase:
     root_cause_candidates: Any
     groundtruth: str
     ttm: Any
+    incident_type_description: str = ""
 
 
 def _sop_to_text(value: Any) -> str:
@@ -112,6 +113,12 @@ def normalize_case(
             "不能使用 Cooperation 模式"
         )
 
+    incident_type_description = next((
+        value.strip()
+        for source in (label, semantic_labels)
+        for key in ("incident_type_description", "alarm_type_description")
+        if isinstance(value := source.get(key), str) and value.strip()
+    ), "")
     return InferenceCase(
         input_index=input_index,
         case_id=_case_id(label, input_index),
@@ -128,4 +135,5 @@ def normalize_case(
         root_cause_candidates=label.get("root_cause_candidates") or [],
         groundtruth=groundtruth_category(label),
         ttm=label.get("ttm", semantic_labels.get("ttm")),
+        incident_type_description=incident_type_description,
     )

@@ -15,6 +15,7 @@ from inference.llm import llm_infer
 from llm_interfaces.competition import CompetitionInference
 from llm_interfaces.cooperation import CooperationInference
 from llm_interfaces.evaluate import run as evaluate
+from llm_interfaces.merge_agent_evaluation import merge_shards
 
 
 class FakeTokenizer:
@@ -34,19 +35,21 @@ def default_answer(instruction, payload):
                 node_id: {**node["result_template"], "reason": "证据不足"}
                 for node_id, node in payload["decision_templates"].items()
             },
-            "conclusion": {**payload["conclusion_template"], "reason": "证据不足"},
+            "conclusion": {**payload["conclusion_template"], "confidence": 0.2, "reason": "证据不足"},
         }
     if "diagnoses" in payload:
         return payload["root_cause_candidates"]
     if instruction.startswith("你是 Orchestrator"):
-        groups = {"log_data": [], "time_series_data": [], "metadata": []}
-        for key in payload["case"]["semantic_labels"]:
-            group = {
-                "anomaly_logs": "log_data", "anomaly_kpi": "time_series_data",
-                "anomaly_netstreams": "time_series_data",
-            }.get(key, "metadata")
-            groups[group].append(key)
-        return groups
+        return {
+            role: {
+                "persona": f"{role} 诊断专家",
+                "focus": [
+                    {"key": field["key"], "desc": "核对告警窗口内的证据"}
+                    for field in fields if field["available"] and field["key"].count("/") == 1
+                ],
+            }
+            for role, fields in payload["semantic_labels_template"].items()
+        }
     if instruction.startswith("你是 Aggregator"):
         return {"ranking": payload["root_cause_candidates"], "reason": "综合意见池"}
     if "opinion_pool" in payload:
@@ -173,6 +176,8 @@ class LlmInterfaceTests(unittest.TestCase):
         self.assertTrue(first["paths"][0][0]["required_condition_met"])
         self.assertFalse(second["paths"][0][0]["required_condition_met"])
         self.assertEqual(verifier["diagnoses"], row["diagnoses"])
+        self.assertTrue(all(item["conclusion"]["confidence"] == 0.2 for item in verifier["diagnoses"]))
+        self.assertTrue(all("supported" not in item["conclusion"] for item in verifier["diagnoses"]))
         self.assertEqual(verifier["case"]["semantic_labels"]["anomaly_logs"], {"message": "peer down"})
         self.assertNotIn("root_cause", verifier["case"])
         self.assertNotIn("sop", verifier["case"]["semantic_labels"])
@@ -194,13 +199,108 @@ class LlmInterfaceTests(unittest.TestCase):
         self.assertEqual(requests[3]["metadata"], {"other_info": {"local_device": "router"}})
         self.assertEqual([request["opinion_pool"] for request in requests[4:7]], [row["opinion_pool"]] * 3)
 
-    def test_cooperation_shares_new_opinions_on_next_round_and_reserves_aggregator(self):
-        def comment_on_every_review(instruction, payload):
+    def test_cooperation_plans_personas_from_candidates_and_telemetry_template(self):
+        def focus_on_log_detail(instruction, payload):
+            answer = default_answer(instruction, payload)
+            if instruction.startswith("你是 Orchestrator"):
+                answer["log"] = {
+                    "persona": "端口事件专家",
+                    "focus": [{"key": "/anomaly_logs/local_flash/port_down", "desc": "检查端口掉线次数"}],
+                }
+            return answer
+
+        label = cooperation_label()
+        label["root_cause_candidates"] = [
+            {"category": "链路故障", "description": "物理链路异常"},
+            {"category": "配置错误", "reason": "配置发生变化"},
+        ]
+        label["semantic_labels"]["anomaly_logs"] = {
+            "local_flash": {"port_down": 0, "port_up": 2},
+            "remote_shutdown": {"user": "UNSELECTED_USER_VALUE"},
+        }
+        label["incident_type_description"] = "监控发现端口状态变化"
+        engine = fake_engine(focus_on_log_detail)
+        inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([label], "端口告警", root)
+
+        self.assertEqual(row["status"], "success")
+        planner = engine.llm.requests[0][1]
+        self.assertEqual(planner["incident_type"], "端口告警")
+        self.assertEqual(planner["incident_type_description"], "监控发现端口状态变化")
+        self.assertEqual(planner["root_cause_candidates"], [
+            {"category": "链路故障", "description": "物理链路异常"},
+            {"category": "配置错误", "description": "配置发生变化"},
+        ])
+        template = planner["semantic_labels_template"]
+        time_fields = {field["key"]: field for field in template["time_series"]}
+        self.assertFalse(time_fields["/anomaly_kpi/offline_loss_rate"]["available"])
+        self.assertNotIn("/anomaly_kpi/temperature", time_fields)
+        log_fields = {field["key"]: field for field in template["log"]}
+        self.assertTrue(log_fields["/anomaly_logs/local_flash/port_down"]["available"])
+        self.assertNotIn("UNSELECTED_USER_VALUE", json.dumps(planner))
+        for index in (1, 4):
+            expert = engine.llm.requests[index][1]
+            self.assertEqual(expert["specialist"], row["personas"]["log"])
+            self.assertEqual(expert["log_data"], {"anomaly_logs": {"local_flash": {"port_down": 0}}})
+
+    def test_cooperation_rejects_focus_from_another_telemetry_group(self):
+        def invalid_persona(instruction, payload):
+            answer = default_answer(instruction, payload)
+            answer["log"]["focus"] = [{"key": "/anomaly_kpi", "desc": "检查 KPI"}]
+            return answer
+
+        engine = fake_engine(invalid_persona)
+        inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([cooperation_label()], "场景", root)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("该类别", row["error"])
+        self.assertEqual(len(engine.llm.requests), 1)
+
+    def test_cooperation_selects_leaf_values_inside_arrays(self):
+        key = "/anomaly_kpi/offline_loss_rate/abnormal_timing_segments/*/value/*"
+
+        def select_samples(instruction, payload):
+            answer = default_answer(instruction, payload)
+            if instruction.startswith("你是 Orchestrator"):
+                answer["time_series"]["focus"] = [{"key": key, "desc": "核查丢包采样值"}]
+            return answer
+
+        label = cooperation_label()
+        label["semantic_labels"]["anomaly_kpi"] = {"offline_loss_rate": {
+            "abnormal_timing_segments": [
+                {"start_time": 10, "value": [0, 100]},
+                {"start_time": 20},
+                {"value": [None]},
+            ],
+        }}
+        engine = fake_engine(select_samples)
+        inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([label], "网络设备掉线", root)
+        self.assertEqual(row["status"], "success")
+        planner = engine.llm.requests[0][1]
+        self.assertIn("探测丢包", planner["incident_type_description"])
+        fields = {entry["key"]: entry for entry in planner["semantic_labels_template"]["time_series"]}
+        self.assertTrue(fields[key]["available"])
+        self.assertEqual(engine.llm.requests[2][1]["time_series_data"], {"anomaly_kpi": {
+            "offline_loss_rate": {"abnormal_timing_segments": [{"value": [0, 100]}, None, {"value": [None]}]},
+        }})
+
+    def test_cooperation_keeps_only_latest_opinion_and_reserves_aggregator(self):
+        def review_opinion(instruction, payload):
             if "opinion_pool" in payload and not instruction.startswith("你是 Aggregator"):
+                time_series_has_revised = any(
+                    item["agent"] == "time_series" and item["round"] == 1
+                    for item in payload["opinion_pool"]
+                )
+                if "metadata" in payload or ("time_series_data" in payload and time_series_has_revised):
+                    return "NO COMMENT"
                 return {"reasoning_chain": ["新增证据"], "root_cause": "链路故障"}
             return default_answer(instruction, payload)
 
-        engine = fake_engine(comment_on_every_review)
+        engine = fake_engine(review_opinion)
         inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
         with tempfile.TemporaryDirectory() as root:
             row, = inference.infer_results([cooperation_label()], "场景", root)
@@ -208,7 +308,9 @@ class LlmInterfaceTests(unittest.TestCase):
         self.assertEqual(row["agent_invocations"], 10)
         self.assertEqual(row["stop_reason"], "invoke_limit")
         pools = [payload["opinion_pool"] for _prompt, payload in engine.llm.requests[4:]]
-        self.assertEqual([len(pool) for pool in pools], [3, 3, 3, 6, 6, 8])
+        self.assertEqual([[item["round"] for item in pool] for pool in pools], [
+            [0, 0, 0], [0, 0, 0], [0, 0, 0], [1, 1, 0], [1, 1, 0], [2, 1, 0],
+        ])
         self.assertEqual(pools[-1], row["opinion_pool"])
 
     def test_nested_groundtruth_is_scored_but_never_sent_to_agents(self):
@@ -247,19 +349,40 @@ class LlmInterfaceTests(unittest.TestCase):
         self.assertEqual(first["status"], "failed")
         self.assertEqual(second["status"], "success")
 
-    def test_inconsistent_candidate_is_not_sent_to_verifier(self):
-        def inconsistent(instruction, payload):
+    def test_competition_sends_low_confidence_candidates_without_eliminating_them(self):
+        def low_confidence(instruction, payload):
             answer = default_answer(instruction, payload)
             if "decision_templates" in payload:
-                answer["conclusion"].update(supported=True, confidence=0.8)
+                for decision in answer["decisions"].values():
+                    decision.update(condition_met=False, confidence=0.95, reason="观察到相反状态")
+                if payload["root_cause"] == "链路故障":
+                    answer["conclusion"].update(confidence=0, reason="节点证据与该分支要求相反")
             return answer
 
-        engine = fake_engine(inconsistent)
+        engine = fake_engine(low_confidence)
+        inference = CompetitionInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([competition_label()], "场景", root)
+        self.assertEqual(row["status"], "success")
+        verifier = engine.llm.requests[-1][1]
+        self.assertEqual(len(verifier["diagnoses"]), 2)
+        first = verifier["diagnoses"][0]
+        self.assertEqual(first["conclusion"]["confidence"], 0)
+        self.assertIs(first["decisions"]["step_01"]["condition_met"], False)
+
+    def test_competition_rejects_binary_root_cause_verdicts(self):
+        def binary_verdict(instruction, payload):
+            answer = default_answer(instruction, payload)
+            if "decision_templates" in payload:
+                answer["conclusion"]["supported"] = False
+            return answer
+
+        engine = fake_engine(binary_verdict)
         inference = CompetitionInference(engine, sampling_params_factory=fake_sampling_params)
         with tempfile.TemporaryDirectory() as root:
             row, = inference.infer_results([competition_label()], "场景", root)
         self.assertEqual(row["status"], "failed")
-        self.assertIn("与所填决策路径不一致", row["error"])
+        self.assertIn("conclusion", row["error"])
         self.assertEqual(len(engine.llm.requests), 2)
 
     def test_competition_writes_category_csv_using_list_index(self):
@@ -308,6 +431,65 @@ class LlmInterfaceTests(unittest.TestCase):
         totals = [row for row in rows if row["alarm_type"] is None]
         self.assertEqual([row["attempted_count"] for row in totals], [2, 2])
         self.assertEqual([row["failed_count"] for row in totals], [0, 0])
+
+    def test_sharded_evaluation_uses_disjoint_cases_and_matches_serial_metrics(self):
+        get_instance = Mock(side_effect=lambda **_kwargs: fake_engine())
+        fake_llm_engine = types.ModuleType("llm_interfaces.llm_engine")
+        fake_llm_engine.LLMEngine = SimpleNamespace(get_instance=get_instance)
+        fake_vllm = types.ModuleType("vllm")
+        fake_vllm.SamplingParams = fake_sampling_params
+        with tempfile.TemporaryDirectory() as root, patch.dict(
+            sys.modules, {"vllm": fake_vllm, "llm_interfaces.llm_engine": fake_llm_engine},
+        ), patch.dict(os.environ):
+            root = Path(root)
+            category = root / "labels" / "场景"
+            category.mkdir(parents=True)
+            first = competition_label()
+            first["root_cause"] = {"category": "链路故障"}
+            labels = [first, cooperation_label(), competition_label(), competition_label()]
+            for index, label in enumerate(labels):
+                (category / f"场景_{index + 10}_label_sample.json").write_text(
+                    json.dumps(label), encoding="utf-8",
+                )
+            second_category = category.parent / "场景二"
+            second_category.mkdir()
+            for index in range(2):
+                (second_category / f"场景二_{index}_label_sample.json").write_text(
+                    json.dumps(competition_label()), encoding="utf-8",
+                )
+            args = SimpleNamespace(
+                label_root=category.parent, output_dir=root / "serial", mode="both",
+                model_path="fake-model", ascend_devices="0,1", max_model_len=16384,
+                batch_size=8, invoke_limit=10, limit_per_category=3, import_top_level_sop=False,
+                limit_per_mode=2,
+            )
+            serial = evaluate(args)
+            parallel = root / "parallel"
+            args.shard_count = 4
+            for index in range(args.shard_count):
+                args.shard_index = index
+                args.output_dir = parallel / f"shard_{index}"
+                evaluate(args)
+
+            self.assertEqual(get_instance.call_count, 3)
+            trace = parallel / "shard_2" / "traces" / "场景" / "competition" / "results.json"
+            cases = json.loads(trace.read_text(encoding="utf-8"))["results"]
+            self.assertEqual([case["case_idx"] for case in cases], [2])
+            merged = merge_shards(parallel, args.shard_count, 5)
+            report = json.loads((parallel / "metrics.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["excluded_without_sop"], 1)
+            self.assertEqual(report["limit_per_mode"], 2)
+            self.assertEqual(report["wall_elapsed_seconds"], 5)
+            self.assertTrue((parallel / "metrics.csv").is_file())
+
+        fields = ("mode", "alarm_type", "attempted_count", "top1", "top3", "top5", "mrr")
+        self.assertEqual(
+            [[row[field] for field in fields] for row in merged],
+            [[row[field] for field in fields] for row in serial],
+        )
+        self.assertEqual(merged[0]["attempted_count"], 2)
+        self.assertEqual(merged[0]["mrr"], 0.75)
+        self.assertEqual([row["attempted_count"] for row in merged if row["alarm_type"] is None], [2, 2])
 
     def test_incremental_agents_route_nested_sop_and_stop_checkpoint_at_failure(self):
         engine = fake_engine()

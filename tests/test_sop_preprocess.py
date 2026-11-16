@@ -76,7 +76,7 @@ class SopPreprocessTests(unittest.TestCase):
             )
         for cause_id, prompt in templates["root_cause_prompts"].items():
             self.assertEqual(prompt["root_cause"], self.sop["root_causes"][cause_id])
-            self.assertEqual(prompt["conclusion_template"].keys(), {"supported", "confidence", "reason"})
+            self.assertEqual(prompt["conclusion_template"].keys(), {"confidence", "reason"})
 
     def test_committed_templates_match_source(self):
         templates = json.loads(

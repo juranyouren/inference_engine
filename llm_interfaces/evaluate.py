@@ -17,7 +17,12 @@ from .io_utils import safe_category_name, save_json
 from .main import configure_ascend_devices, load_json_case
 
 
-def load_groups(root, limit, import_top_level_sop):
+def load_groups(
+    root, limit, import_top_level_sop, *, require_sop=False, limit_per_mode=None,
+    shard_count=1, shard_index=0,
+):
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("分片编号必须从 0 开始且小于分片总数")
     if not root.is_dir():
         raise ValueError(f"找不到样例或 label 目录: {root}")
     groups = {}
@@ -28,16 +33,27 @@ def load_groups(root, limit, import_top_level_sop):
         if indexed:
             groups.setdefault(folder.name, []).extend(Path(indexed[index]) for index in sorted(indexed))
 
-    loaded = {}
-    for alarm_type, paths in groups.items():
-        loaded[alarm_type] = []
-        for path in paths[:limit]:
+    loaded = {alarm_type: [] for alarm_type in groups}
+    excluded_without_sop = 0
+    selected_count = 0
+    for alarm_type, paths in sorted(groups.items()):
+        for case_index, path in enumerate(paths[:limit]):
+            if selected_count == limit_per_mode:
+                return loaded, excluded_without_sop
+            assigned = case_index % shard_count == shard_index
+            if not assigned and limit_per_mode is None:
+                continue
             label = load_json_case(path)
             labels = label.get("semantic_labels")
             if import_top_level_sop and isinstance(labels, dict) and not read_sop(label):
                 label = {**label, "semantic_labels": {**labels, "sop": label.get("sop")}}
-            loaded[alarm_type].append(label)
-    return loaded
+            if require_sop and not read_sop(label):
+                excluded_without_sop += int(assigned)
+                continue
+            selected_count += 1
+            if assigned:
+                loaded[alarm_type].append((case_index, label))
+    return loaded, excluded_without_sop
 
 
 def _metrics(mode, alarm_type, results, elapsed):
@@ -48,20 +64,15 @@ def _metrics(mode, alarm_type, results, elapsed):
     }
 
 
-def run(args):
-    groups = load_groups(args.label_root, args.limit_per_category, args.import_top_level_sop)
-    if not groups:
-        raise ValueError("没有找到可评测的 label 文件")
-    without_sop_count = sum(not read_sop(label) for labels in groups.values() for label in labels)
-    if args.mode != "cooperation":
-        groups = {
-            category: [label for label in labels if read_sop(label)]
-            for category, labels in groups.items()
-        }
-        groups = {category: labels for category, labels in groups.items() if labels}
-        if not groups:
-            raise ValueError("没有包含 semantic_labels.sop 的 case。保存的样例可用 --import-top-level-sop")
+def _write_report(output_dir, metadata, rows):
+    save_json({**metadata, "metrics": rows}, output_dir / "metrics.json")
+    with (output_dir / "metrics.csv").open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
+
+def _load_agents(args, mode_names):
     os.environ.setdefault("ASCEND_RT_VISIBLE_DEVICES", str(config.ASCEND_RT_VISIBLE_DEVICES))
     configure_ascend_devices(args)
     from .competition import CompetitionInference
@@ -70,37 +81,59 @@ def run(args):
 
     engine = LLMEngine.get_instance(model_path=args.model_path, max_model_len=args.max_model_len)
     modes = {}
-    if args.mode in ("both", "competition"):
+    if "competition" in mode_names:
         modes["competition"] = CompetitionInference(engine, batch_size=args.batch_size)
-    if args.mode in ("both", "cooperation"):
+    if "cooperation" in mode_names:
         modes["cooperation"] = CooperationInference(
             engine, batch_size=args.batch_size, invoke_limit=args.invoke_limit,
         )
+    return modes
+
+
+def run(args):
+    shard_count = getattr(args, "shard_count", 1)
+    shard_index = getattr(args, "shard_index", 0)
+    limit_per_mode = getattr(args, "limit_per_mode", None)
+    groups, without_sop_count = load_groups(
+        args.label_root, args.limit_per_category, args.import_top_level_sop,
+        require_sop=args.mode != "cooperation", limit_per_mode=limit_per_mode,
+        shard_count=shard_count, shard_index=shard_index,
+    )
+    if not groups:
+        raise ValueError("没有找到可评测的 label 文件")
+
+    groups = {category: cases for category, cases in groups.items() if cases}
+    if not groups and shard_count == 1:
+        raise ValueError("没有包含 semantic_labels.sop 的 case。保存的样例可用 --import-top-level-sop")
+
+    mode_names = ("competition", "cooperation") if args.mode == "both" else (args.mode,)
+    modes = _load_agents(args, mode_names) if groups else {}
 
     rows = []
-    for mode, inference in modes.items():
+    for mode in mode_names:
         all_results = []
         total_elapsed = 0.0
-        for alarm_type, labels in groups.items():
+        for alarm_type, cases in groups.items():
+            indices, labels = zip(*cases)
+            labels = list(labels)
             inputs = [without_sop(label) for label in labels] if mode == "cooperation" else labels
             trace_root = args.output_dir / "traces" / safe_category_name(alarm_type)
             start = perf_counter()
-            results = inference.infer_results(inputs, alarm_type, trace_root)
+            results = modes[mode].infer_results(
+                inputs, alarm_type, trace_root, case_indices=indices if shard_count > 1 else None,
+            )
             elapsed = perf_counter() - start
             rows.append(_metrics(mode, alarm_type, results, elapsed))
             all_results.extend(results)
             total_elapsed += elapsed
         rows.append(_metrics(mode, None, all_results, total_elapsed))
 
-    save_json({
+    _write_report(args.output_dir, {
         "mode": args.mode, "label_root": str(args.label_root.resolve()),
-        "excluded_without_sop": without_sop_count if args.mode != "cooperation" else 0,
-        "metrics": rows,
-    }, args.output_dir / "metrics.json")
-    with (args.output_dir / "metrics.csv").open("w", encoding="utf-8-sig", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+        "excluded_without_sop": without_sop_count,
+        "limit_per_mode": limit_per_mode,
+        "shard_count": shard_count, "shard_index": shard_index,
+    }, rows)
     return rows
 
 
@@ -118,11 +151,18 @@ def main(argv=None):
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--invoke-limit", type=int, default=10)
     parser.add_argument("--limit-per-category", type=int)
+    parser.add_argument(
+        "--limit-per-mode", type=int, help="每种模式最多评测前 N 个符合条件的 case，跨类别及分片累计",
+    )
+    parser.add_argument("--shard-count", type=int, default=1, help="每类样本轮流分给几个分片")
+    parser.add_argument("--shard-index", type=int, default=0, help="本进程的分片编号，从 0 开始")
     parser.add_argument("--import-top-level-sop", action="store_true",
                         help="将样例顶层 SOP 显式复制到内存中的 semantic_labels.sop")
     args = parser.parse_args(argv)
-    if args.limit_per_category is not None and args.limit_per_category < 1:
-        parser.error("--limit-per-category 必须大于 0")
+    for option, limit in (("--limit-per-category", args.limit_per_category),
+                          ("--limit-per-mode", args.limit_per_mode)):
+        if limit is not None and limit < 1:
+            parser.error(f"{option} 必须大于 0")
     try:
         rows = run(args)
     except (OSError, TypeError, ValueError, RuntimeError) as exc:

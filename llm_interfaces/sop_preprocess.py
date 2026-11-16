@@ -15,9 +15,10 @@ PROMPT_INSTRUCTIONS = (
     "决策 ID 为键，每个节点按 result_template 填写一次。diagnostic_clues 每项记录相关"
     "证据的具体 path 和原始 value。condition_met 是实际判断，取 true、false 或 null。"
     "required_condition_met 是路径要求。证据缺失、无法解释或冲突时填 null 并说明原因。"
-    "按 conclusion_template 填写 conclusion。有一条路径的所有节点均匹配时，"
-    "supported 填 true。每条路径均有明确不匹配的节点时填 false，其余填 null。"
-    "已判定时 confidence 取 0 到 1，未知时填 null。reason 简述判断依据。"
+    "节点 confidence 表示对条件判断的把握，取 0 到 1，未知时填 null。"
+    "按 conclusion_template 填写 conclusion。confidence 表示该根因至少有一条路径成立的置信度，"
+    "每个根因必须给出 0 到 1 的数值，即使证据不足或存在冲突。reason 概括匹配证据及缺口。"
+    "只报告置信度和依据，根因判断和排序由 Verifier 负责。"
 )
 
 
@@ -108,7 +109,6 @@ def compile_sop(sop: dict[str, Any]) -> dict[str, Any]:
             "prompt": PROMPT_INSTRUCTIONS,
             "paths": paths_by_cause[cause_id],
             "conclusion_template": {
-                "supported": None,
                 "confidence": None,
                 "reason": "",
             },
