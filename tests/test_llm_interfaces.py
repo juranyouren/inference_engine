@@ -362,6 +362,35 @@ class LlmInterfaceTests(unittest.TestCase):
         self.assertEqual(aggregator["abstained_specialists"], ["metadata"])
         self.assertEqual([item["agent"] for item in aggregator["opinion_pool"]], ["log"])
 
+    def test_cooperation_keeps_other_responses_when_log_completion_is_empty(self):
+        engine = fake_engine()
+        original_chat = engine.llm.chat
+
+        def chat_without_log_completion(prompts, params, use_tqdm=False):
+            outputs = original_chat(prompts, params, use_tqdm=use_tqdm)
+            for chat, output in zip(prompts, outputs):
+                _, payload = chat[0]["content"].split("\n\n输入 JSON\n", 1)
+                if "log_data" in json.loads(payload):
+                    output.outputs = []
+            return outputs
+
+        engine.llm.chat = chat_without_log_completion
+        inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
+        label = cooperation_label()
+        label["semantic_labels"]["anomaly_kpi"] = {}
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([label], "场景", root)
+            case_dir = Path(row["output_dir"])
+            self.assertTrue((case_dir / "round0/log/prompt.txt").is_file())
+            self.assertEqual((case_dir / "round0/log/raw_responses.txt").read_text(encoding="utf-8"), "")
+            self.assertTrue((case_dir / "round0/metadata/raw_responses.txt").read_text(encoding="utf-8"))
+
+        self.assertEqual(row["status"], "success")
+        self.assertEqual([entry["agent"] for entry in row["opinion_pool"]], ["metadata"])
+        self.assertEqual(row["specialist_issues"][0], {
+            "agent": "log", "round": 0, "error": "log 专家未返回最终回答",
+        })
+
     def test_cooperation_records_insufficient_evidence_when_all_telemetry_is_empty(self):
         label = cooperation_label()
         label["semantic_labels"] = {"anomaly_logs": {}, "anomaly_kpi": {"value": [None, " "]}}

@@ -120,7 +120,10 @@ class CooperationInference(AgentInference):
 
     @staticmethod
     def _opinion(response, candidates, role, round_index):
-        if final_text(response) == "NO COMMENT":
+        text = final_text(response)
+        if not text:
+            raise ValueError(f"{role} 专家未返回最终回答")
+        if text == "NO COMMENT":
             return None
         opinion = response_json(response)
         if not isinstance(opinion, dict):
@@ -155,9 +158,15 @@ class CooperationInference(AgentInference):
             skipped_specialists={}, specialist_issues=[],
         )
 
-        def invoke(requests):
+        def invoke(requests, *, allow_empty_responses=False):
             result["agent_invocations"] += len(requests)
-            return self.generator.generate(requests, output_dir)
+            try:
+                return self.generator.generate(
+                    requests, output_dir, allow_empty_responses=allow_empty_responses,
+                )
+            except (ValueError, RuntimeError) as exc:
+                stages = ", ".join(stage for stage, _prompt, _payload in requests)
+                raise RuntimeError(f"合作型调用失败 [{stages}]: {exc}") from exc
 
         template = semantic_labels_template(labels)
         plan, = invoke([("orchestrator", ORCHESTRATOR_PROMPT, {
@@ -208,7 +217,7 @@ class CooperationInference(AgentInference):
             initial = invoke([
                 (f"round0/{role}", SPECIALIST_PROMPT + OPINION_PROMPT, specialist_data[role])
                 for role in roles
-            ])
+            ], allow_empty_responses=True)
             collect_opinions(initial, roles, 0)
         if not latest:
             result["stop_reason"] = "insufficient_evidence"
@@ -226,7 +235,7 @@ class CooperationInference(AgentInference):
                     {**specialist_data[role], "opinion_pool": snapshot},
                 )
                 for role in active
-            ])
+            ], allow_empty_responses=True)
             if collect_opinions(answers, active, round_index) and len(active) == len(roles):
                 result["early_stopped"] = True
                 break

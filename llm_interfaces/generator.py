@@ -35,7 +35,9 @@ class RCAGenerator:
         self.prompt_safety_tokens = prompt_safety_tokens
         self._sampling_params_factory = sampling_params_factory
 
-    def generate(self, requests: list[AgentRequest], output_dir: Path) -> list[str]:
+    def generate(
+        self, requests: list[AgentRequest], output_dir: Path, *, allow_empty_responses=False,
+    ) -> list[str]:
         prompts = [
             instruction + "\n\n输入 JSON\n" + json.dumps(payload, ensure_ascii=False)
             for _stage, instruction, payload in requests
@@ -50,6 +52,7 @@ class RCAGenerator:
                 batch_size=self.batch_size, prompt_safety_tokens=self.prompt_safety_tokens,
                 prompt_output_paths=[folder / "prompt.txt" for folder in stage_dirs],
                 require_complete_input=True,
+                allow_empty_responses=allow_empty_responses,
             )
         for response, folder in zip(responses, stage_dirs):
             save_text(response, folder / "raw_responses.txt")

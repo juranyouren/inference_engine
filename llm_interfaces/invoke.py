@@ -195,6 +195,7 @@ def vllm_invoke(
     prompt_safety_tokens: int,
     prompt_output_paths: Optional[List[str | Path]] = None,
     require_complete_input: bool = False,
+    allow_empty_responses: bool = False,
 ) -> List[str]:
     if not inputs:
         return []
@@ -226,14 +227,16 @@ def vllm_invoke(
             sampling_params,
             use_tqdm=False,
         )
+        if len(outputs) != len(batch_inputs):
+            raise RuntimeError(
+                f"vLLM 响应数量不匹配: inputs={len(batch_inputs)}, responses={len(outputs)}"
+            )
         for output in outputs:
-            if not getattr(output, "outputs", None):
+            completions = getattr(output, "outputs", None)
+            if completions:
+                responses.append(completions[0].text)
+            elif allow_empty_responses:
+                responses.append("")
+            else:
                 raise RuntimeError("vLLM 返回了空响应")
-            responses.append(output.outputs[0].text)
-
-    if len(responses) != len(inputs):
-        raise RuntimeError(
-            f"vLLM 响应数量不匹配: inputs={len(inputs)}, "
-            f"responses={len(responses)}"
-        )
     return responses
