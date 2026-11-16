@@ -391,6 +391,30 @@ class LlmInterfaceTests(unittest.TestCase):
             "agent": "log", "round": 0, "error": "log 专家未返回最终回答",
         })
 
+    def test_cooperation_forwards_evidence_from_only_specialist_with_unmatched_cause(self):
+        def metadata_opinion(instruction, payload):
+            if "metadata" in payload and "specialist" in payload and "opinion_pool" not in payload:
+                return {"reasoning_chain": ["本端接口状态为 DOWN"], "root_cause": "接口状态异常"}
+            return default_answer(instruction, payload)
+
+        label = cooperation_label()
+        label["semantic_labels"] = {
+            "anomaly_logs": {"local_shutdown": {}}, "anomaly_kpi": {},
+            "other_info": {"command_echo_info": {"local_interface_status": "DOWN"}},
+        }
+        engine = fake_engine(metadata_opinion)
+        inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([label], "BGP邻接状态改变", root)
+
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(set(row["skipped_specialists"]), {"log", "time_series"})
+        self.assertEqual(row["opinion_pool"], [{
+            "agent": "metadata", "round": 0, "reasoning_chain": ["本端接口状态为 DOWN"], "root_cause": None,
+        }])
+        self.assertEqual(engine.llm.requests[-1][1]["opinion_pool"], row["opinion_pool"])
+        self.assertIn("已保留证据链", row["specialist_issues"][0]["error"])
+
     def test_cooperation_records_insufficient_evidence_when_all_telemetry_is_empty(self):
         label = cooperation_label()
         label["semantic_labels"] = {"anomaly_logs": {}, "anomaly_kpi": {"value": [None, " "]}}

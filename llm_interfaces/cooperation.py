@@ -38,7 +38,8 @@ SPECIALIST_PROMPT = (
 OPINION_PROMPT = (
     '能形成意见时，只输出 JSON 对象 {"reasoning_chain":["证据 → 诊断判断"],"root_cause":"根因名称"}。'
     "简述可核查的证据和诊断依据，并标注缺失证据。候选列表非空时从中选择根因。"
-    "证据不足以形成意见时，只输出 NO COMMENT。"
+    "有可核查证据但无法确定候选根因时，保留依据并将 root_cause 填为 null。"
+    "没有可补充证据时，只输出 NO COMMENT。"
 )
 REVIEW_PROMPT = (
     "审阅同一轮收到的各专家最新意见及你的原始证据。有新增证据或修正时提交一份完整的更新意见，"
@@ -50,6 +51,7 @@ AGGREGATOR_PROMPT = (
     '{"ranking":["最可能根因","其他根因"],"reason":"主要依据和不确定性"}。'
     "skipped_specialists 列出缺少可用遥测或未选择相关线索的专家，将其视为证据缺口。"
     "abstained_specialists 列出未形成可用意见的专家。"
+    "意见中 root_cause 为 null 表示该专家只提供证据，请结合这些证据判断候选根因。"
     "若提供候选列表，按可能性排列全部候选，每项恰好一次。"
 )
 
@@ -128,16 +130,17 @@ class CooperationInference(AgentInference):
         opinion = response_json(response)
         if not isinstance(opinion, dict):
             raise ValueError(f"{role} 专家的意见必须为 JSON 对象")
-        if "root_cause" in opinion and opinion["root_cause"] is None:
-            return None
         chain = opinion.get("reasoning_chain")
         cause = opinion.get("root_cause")
+        if "root_cause" in opinion and cause is None and not chain:
+            return None
         if not isinstance(chain, list) or not chain or any(
             not isinstance(item, str) or not item.strip() for item in chain
         ):
             raise ValueError(f"{role} 专家的 reasoning_chain 必须为非空字符串列表")
-        if not isinstance(cause, str) or not cause.strip() or (candidates and cause not in candidates):
-            raise ValueError(f"{role} 专家返回了无效的根因")
+        cause = cause.strip() if isinstance(cause, str) else None
+        if not cause or (candidates and cause not in candidates):
+            cause = None
         return {"agent": role, "round": round_index, "reasoning_chain": chain, "root_cause": cause}
 
     def _infer_case(self, case, output_dir, result):
@@ -206,6 +209,11 @@ class CooperationInference(AgentInference):
                 if opinion is None:
                     no_comment.append(role)
                 else:
+                    if opinion["root_cause"] is None:
+                        result["specialist_issues"].append({
+                            "agent": role, "round": round_index,
+                            "error": "专家未给出可匹配的根因，已保留证据链",
+                        })
                     latest[role] = opinion
                     commented.append(role)
             result["opinion_pool"] = [latest[role] for role in roles if role in latest]
