@@ -38,6 +38,8 @@ Orchestrator 为每类遥测输出一个 `persona` 及其关注点。`key` 是�
 
 三份初评进入意见池。每位专家输出 `reasoning_chain` 和 `root_cause`，程序补充角色和轮次。此处的 `root_cause` 是专家给出的预测。
 
+实际样本可能只有部分遥测。所选字段没有可用数据的专家会被跳过，其他专家可在初评和复评中返回 `NO COMMENT`。Aggregator 使用已有意见，并收到缺失遥测或未形成意见的专家名单。若没有任何可用意见，`result.json` 会记录 `insufficient_evidence`。
+
 ```json
 [
   {"agent":"log","round":0,"reasoning_chain":["告警前后接口先 DOWN 后 UP，支持短时中断"],"root_cause":"链路瞬断"},

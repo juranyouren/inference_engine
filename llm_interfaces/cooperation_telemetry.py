@@ -29,6 +29,16 @@ def _fields(node, parent=""):
         yield from _fields(value, key)
 
 
+def has_telemetry(value):
+    if isinstance(value, dict):
+        return any(has_telemetry(item) for item in value.values())
+    if isinstance(value, list):
+        return any(has_telemetry(item) for item in value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value is not None
+
+
 def semantic_labels_template(labels):
     base = _base_template()
     root_roles = {
@@ -49,7 +59,7 @@ def semantic_labels_template(labels):
             entry = fields.setdefault(key, {
                 "key": key, "desc": "样本提供的扩展字段，结合字段名及上级遥测解释。", "available": False,
             })
-            entry["available"] |= raw_value not in (None, "", {}, [])
+            entry["available"] |= has_telemetry(raw_value)
     return {role: list(fields.values()) for role, fields in catalog.items()}
 
 

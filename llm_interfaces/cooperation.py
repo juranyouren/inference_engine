@@ -36,8 +36,9 @@ SPECIALIST_PROMPT = (
     "区分已观测证据和缺失数据。"
 )
 OPINION_PROMPT = (
-    '只输出 JSON 对象 {"reasoning_chain":["证据 → 诊断判断"],"root_cause":"根因名称"}。'
+    '能形成意见时，只输出 JSON 对象 {"reasoning_chain":["证据 → 诊断判断"],"root_cause":"根因名称"}。'
     "简述可核查的证据和诊断依据，并标注缺失证据。候选列表非空时从中选择根因。"
+    "证据不足以形成意见时，只输出 NO COMMENT。"
 )
 REVIEW_PROMPT = (
     "审阅同一轮收到的各专家最新意见及你的原始证据。有新增证据或修正时提交一份完整的更新意见，"
@@ -47,6 +48,8 @@ REVIEW_PROMPT = (
 AGGREGATOR_PROMPT = (
     '你是 Aggregator。综合各专家最新意见中的证据与分歧，输出 JSON 对象 '
     '{"ranking":["最可能根因","其他根因"],"reason":"主要依据和不确定性"}。'
+    "skipped_specialists 列出缺少可用遥测或未选择相关线索的专家，将其视为证据缺口。"
+    "abstained_specialists 列出未形成可用意见的专家。"
     "若提供候选列表，按可能性排列全部候选，每项恰好一次。"
 )
 
@@ -90,9 +93,13 @@ class CooperationInference(AgentInference):
     @staticmethod
     def _personas(response, template):
         personas = response_json(response)
-        if not isinstance(personas, dict) or personas.keys() != SPECIALISTS.keys():
+        if not isinstance(personas, dict) or not personas.keys() <= SPECIALISTS.keys():
             raise ValueError("Orchestrator 必须为 log、time_series、metadata 各生成一个 persona")
-        for role, specialist in personas.items():
+        for role in SPECIALISTS:
+            specialist = personas.get(role)
+            if specialist is None and not any(item["available"] for item in template[role]):
+                personas[role] = {"persona": f"{role} 专家暂无可用遥测", "focus": []}
+                continue
             if not isinstance(specialist, dict) or specialist.keys() != {"persona", "focus"}:
                 raise ValueError(f"{role} 专家必须包含 persona 和 focus")
             persona, focus = specialist["persona"], specialist["focus"]
@@ -113,9 +120,13 @@ class CooperationInference(AgentInference):
 
     @staticmethod
     def _opinion(response, candidates, role, round_index):
+        if final_text(response) == "NO COMMENT":
+            return None
         opinion = response_json(response)
         if not isinstance(opinion, dict):
             raise ValueError(f"{role} 专家的意见必须为 JSON 对象")
+        if "root_cause" in opinion and opinion["root_cause"] is None:
+            return None
         chain = opinion.get("reasoning_chain")
         cause = opinion.get("root_cause")
         if not isinstance(chain, list) or not chain or any(
@@ -141,6 +152,7 @@ class CooperationInference(AgentInference):
         result.update(
             opinion_pool=[], invoke_limit=self.invoke_limit, agent_invocations=0,
             round_count=0, early_stopped=False, rounds=[],
+            skipped_specialists={}, specialist_issues=[],
         )
 
         def invoke(requests):
@@ -156,25 +168,51 @@ class CooperationInference(AgentInference):
         })])
         personas = self._personas(plan, template)
         result["personas"] = personas
-        specialist_data = {
-            role: {
-                **context, "specialist": personas[role],
-                group: select_telemetry(labels, personas[role]["focus"]),
+        specialist_data = {}
+        for role, group in SPECIALISTS.items():
+            available = {item["key"] for item in template[role] if item["available"]}
+            focus = personas[role]["focus"]
+            missing = [detail["key"] for detail in focus if detail["key"] not in available]
+            if len(missing) == len(focus):
+                result["skipped_specialists"][role] = (
+                    "所选遥测没有可用数据" if focus else "未选择相关遥测"
+                )
+                continue
+            specialist_data[role] = {
+                **context, "specialist": personas[role], "missing_focus_keys": missing,
+                group: select_telemetry(labels, focus),
             }
-            for role, group in SPECIALISTS.items()
-        }
 
-        roles = list(SPECIALISTS)
-        initial = invoke([
-            (f"round0/{role}", SPECIALIST_PROMPT + OPINION_PROMPT, specialist_data[role])
-            for role in roles
-        ])
-        latest = {
-            role: self._opinion(answer, candidates, role, 0) for role, answer in zip(roles, initial)
-        }
-        result["opinion_pool"] = list(latest.values())
-        result["rounds"].append({"round": 0, "commented": roles, "no_comment": []})
-        result["round_count"] = 1
+        roles = list(specialist_data)
+        latest = {}
+
+        def collect_opinions(answers, active, round_index):
+            commented, no_comment = [], []
+            for role, answer in zip(active, answers):
+                try:
+                    opinion = self._opinion(answer, candidates, role, round_index)
+                except ValueError as exc:
+                    result["specialist_issues"].append({"agent": role, "round": round_index, "error": str(exc)})
+                    opinion = None
+                if opinion is None:
+                    no_comment.append(role)
+                else:
+                    latest[role] = opinion
+                    commented.append(role)
+            result["opinion_pool"] = [latest[role] for role in roles if role in latest]
+            result["rounds"].append({"round": round_index, "commented": commented, "no_comment": no_comment})
+            result["round_count"] = round_index + 1
+            return not commented
+
+        if roles:
+            initial = invoke([
+                (f"round0/{role}", SPECIALIST_PROMPT + OPINION_PROMPT, specialist_data[role])
+                for role in roles
+            ])
+            collect_opinions(initial, roles, 0)
+        if not latest:
+            result["stop_reason"] = "insufficient_evidence"
+            raise ValueError("没有专家能够根据可用遥测形成根因意见")
 
         while result["agent_invocations"] < self.invoke_limit - 1:
             remaining = self.invoke_limit - result["agent_invocations"] - 1
@@ -189,27 +227,17 @@ class CooperationInference(AgentInference):
                 )
                 for role in active
             ])
-            no_comment = []
-            new_opinions = []
-            for role, answer in zip(active, answers):
-                if final_text(answer) == "NO COMMENT":
-                    no_comment.append(role)
-                else:
-                    new_opinions.append(self._opinion(answer, candidates, role, round_index))
-            latest.update((opinion["agent"], opinion) for opinion in new_opinions)
-            result["opinion_pool"] = list(latest.values())
-            result["rounds"].append({
-                "round": round_index, "commented": [item["agent"] for item in new_opinions],
-                "no_comment": no_comment,
-            })
-            result["round_count"] += 1
-            if len(no_comment) == len(roles):
+            if collect_opinions(answers, active, round_index) and len(active) == len(roles):
                 result["early_stopped"] = True
                 break
 
         result["stop_reason"] = "all_no_comment" if result["early_stopped"] else "invoke_limit"
         answer, = invoke([
-            ("aggregator", AGGREGATOR_PROMPT, {**context, "opinion_pool": result["opinion_pool"]}),
+            ("aggregator", AGGREGATOR_PROMPT, {
+                **context, "opinion_pool": result["opinion_pool"],
+                "skipped_specialists": result["skipped_specialists"],
+                "abstained_specialists": [role for role in roles if role not in latest],
+            }),
         ])
         result["final_result"] = answer
         conclusion = response_json(answer)

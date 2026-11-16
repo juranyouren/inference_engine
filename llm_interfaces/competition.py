@@ -11,6 +11,7 @@ VERIFIER_PROMPT = (
     "你是 Verifier。结合 case 中的原始证据、SOP 的决策条件以及每条候选诊断的"
     "节点检查状态、证据引用和根因分支置信度，独立复核每个根因。"
     "把置信度作为参考，结合矛盾和缺失证据判断全部候选的相对可能性。"
+    "候选 Agent 未报告的节点标为未知，请结合原始证据自行复核。"
     "只输出候选根因名称的 JSON 数组，按可能性从高到低排列，全部候选恰好出现一次。"
 )
 
@@ -34,20 +35,31 @@ def _validate_judgment(judgment, template, name, *, check_node=False):
 
 def _validate_diagnosis(response, prompt, templates):
     diagnosis = response_json(response)
-    if not isinstance(diagnosis, dict) or diagnosis.keys() != {"decisions", "conclusion"}:
+    if not isinstance(diagnosis, dict) or not diagnosis.keys() <= {"decisions", "conclusion"}:
         raise ValueError("竞争型 Agent 必须返回 decisions 和 conclusion 对象")
-    decisions = diagnosis.get("decisions")
-    if not isinstance(decisions, dict) or decisions.keys() != templates.keys():
-        raise ValueError("竞争型 Agent 必须填写路径涉及的全部决策节点")
-    for node_id, node in decisions.items():
-        _validate_judgment(node, templates[node_id]["result_template"], node_id, check_node=True)
-        clues = node["diagnostic_clues"]
-        if not isinstance(clues, list) or any(
-            not isinstance(item, dict) or item.keys() != {"path", "value"}
-            or not isinstance(item["path"], str) or not item["path"].startswith("$.")
-            for item in clues
-        ):
-            raise ValueError(f"{node_id} 的证据必须是 path/value 列表")
+    reported = diagnosis.get("decisions")
+    if not isinstance(reported, dict):
+        reported = {}
+    decisions = {}
+    for node_id, template in templates.items():
+        node = reported.get(node_id)
+        result_template = template["result_template"]
+        if node is None or node == {}:
+            decisions[node_id] = {**result_template, "reason": "候选 Agent 未报告该节点，等待 Verifier 复核。"}
+            continue
+        try:
+            _validate_judgment(node, result_template, node_id, check_node=True)
+            clues = node["diagnostic_clues"]
+            if not isinstance(clues, list) or any(
+                not isinstance(item, dict) or item.keys() != {"path", "value"}
+                or not isinstance(item["path"], str) or not item["path"].startswith("$.")
+                for item in clues
+            ):
+                raise ValueError(f"{node_id} 的证据必须是 path/value 列表")
+        except ValueError as exc:
+            decisions[node_id] = {**result_template, "reason": f"节点报告无效，等待 Verifier 复核。{exc}"}
+        else:
+            decisions[node_id] = node
     conclusion = diagnosis.get("conclusion")
     _validate_judgment(conclusion, prompt["conclusion_template"], "conclusion")
     return {"root_cause": prompt["root_cause"], "paths": prompt["paths"],

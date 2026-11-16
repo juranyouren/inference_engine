@@ -313,6 +313,45 @@ class LlmInterfaceTests(unittest.TestCase):
         ])
         self.assertEqual(pools[-1], row["opinion_pool"])
 
+    def test_cooperation_skips_missing_telemetry_and_accepts_initial_abstention(self):
+        def missing_telemetry(instruction, payload):
+            if "metadata" in payload:
+                return "NO COMMENT"
+            return default_answer(instruction, payload)
+
+        label = cooperation_label()
+        label["semantic_labels"]["anomaly_kpi"] = {"offline_loss_rate": {"abnormal_timing_segments": []}}
+        engine = fake_engine(missing_telemetry)
+        inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([label], "场景", root)
+            self.assertTrue((Path(row["output_dir"]) / "aggregator/raw_responses.txt").is_file())
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(row["predicted_list_v1"], ["链路故障", "配置错误"])
+        self.assertEqual(row["rounds"][0]["no_comment"], ["metadata"])
+        self.assertFalse(any("time_series_data" in payload for _prompt, payload in engine.llm.requests))
+        aggregator = engine.llm.requests[-1][1]
+        self.assertEqual(list(aggregator["skipped_specialists"]), ["time_series"])
+        self.assertEqual(aggregator["abstained_specialists"], ["metadata"])
+        self.assertEqual([item["agent"] for item in aggregator["opinion_pool"]], ["log"])
+
+    def test_cooperation_records_insufficient_evidence_when_all_telemetry_is_empty(self):
+        label = cooperation_label()
+        label["semantic_labels"] = {"anomaly_logs": {}, "anomaly_kpi": {"value": [None, " "]}}
+
+        def omit_unavailable_personas(instruction, payload):
+            return {}
+
+        engine = fake_engine(omit_unavailable_personas)
+        inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([label], "场景", root)
+            saved = json.loads((Path(row["output_dir"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["stop_reason"], "insufficient_evidence")
+        self.assertEqual(saved["predicted_list_v1"], [])
+        self.assertEqual(set(saved["skipped_specialists"]), {"log", "metadata", "time_series"})
+        self.assertEqual(len(engine.llm.requests), 1)
+
     def test_nested_groundtruth_is_scored_but_never_sent_to_agents(self):
         sentinel = "EVALUATION_ONLY_PRIVATE_ANNOTATION"
         for inference_class, label_factory in (
@@ -369,6 +408,33 @@ class LlmInterfaceTests(unittest.TestCase):
         first = verifier["diagnoses"][0]
         self.assertEqual(first["conclusion"]["confidence"], 0)
         self.assertIs(first["decisions"]["step_01"]["condition_met"], False)
+
+    def test_competition_fills_missing_decisions_before_verification(self):
+        def omit_decisions(instruction, payload):
+            answer = default_answer(instruction, payload)
+            if "decision_templates" in payload:
+                if payload["root_cause"] == "根因1":
+                    answer.pop("decisions")
+                else:
+                    answer["decisions"].pop("step_01")
+                    answer["decisions"]["step_02"].update(condition_met=False, confidence=0.9)
+            return answer
+
+        engine = fake_engine(omit_decisions)
+        inference = CompetitionInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([competition_label(("根因1", "根因2", "根因3"))], "场景", root)
+            self.assertTrue((Path(row["output_dir"]) / "verifier/raw_responses.txt").is_file())
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(row["predicted_list_v1"], ["根因1", "根因2", "根因3"])
+        diagnoses = engine.llm.requests[-1][1]["diagnoses"]
+        for diagnosis in diagnoses:
+            missing = diagnosis["decisions"]["step_01"]
+            self.assertIsNone(missing["condition_met"])
+            self.assertIsNone(missing["confidence"])
+            self.assertIn("未报告", missing["reason"])
+            self.assertEqual(diagnosis["conclusion"]["confidence"], 0.2)
+        self.assertIs(diagnoses[1]["decisions"]["step_02"]["condition_met"], False)
 
     def test_competition_rejects_binary_root_cause_verdicts(self):
         def binary_verdict(instruction, payload):
