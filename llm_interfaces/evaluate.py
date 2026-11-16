@@ -52,6 +52,7 @@ def load_groups(
                 continue
             selected_count += 1
             if assigned:
+                label["_label_file_path"] = str(path.resolve())
                 loaded[alarm_type].append((case_index, label))
     return loaded, excluded_without_sop
 

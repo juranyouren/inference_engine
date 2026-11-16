@@ -5,7 +5,7 @@ from __future__ import annotations
 from .agent_runner import (
     AgentInference, final_text, response_json, validate_ranking,
 )
-from .cooperation_telemetry import select_telemetry, semantic_labels_template
+from .cooperation_telemetry import normalize_telemetry, select_telemetry, semantic_labels_template
 from .result_parser import candidate_categories
 
 
@@ -138,7 +138,7 @@ class CooperationInference(AgentInference):
         return {"agent": role, "round": round_index, "reasoning_chain": chain, "root_cause": cause}
 
     def _infer_case(self, case, output_dir, result):
-        labels = case.semantic_labels
+        labels = normalize_telemetry(case.semantic_labels)
         candidate_details = _candidate_details(case.root_cause_candidates)
         candidates = [item["category"] for item in candidate_details]
         incident_description = case.incident_type_description or INCIDENT_DESCRIPTIONS.get(

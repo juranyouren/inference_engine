@@ -288,6 +288,33 @@ class LlmInterfaceTests(unittest.TestCase):
             "offline_loss_rate": {"abnormal_timing_segments": [{"value": [0, 100]}, None, {"value": [None]}]},
         }})
 
+    def test_cooperation_extracts_shutdown_records_from_json_encoded_logs(self):
+        key = "/anomaly_logs/local_shutdown"
+
+        def select_shutdown(instruction, payload):
+            answer = default_answer(instruction, payload)
+            if instruction.startswith("你是 Orchestrator"):
+                answer["log"]["focus"] = [{"key": key, "desc": "检查本端接口关闭记录"}]
+            return answer
+
+        label = cooperation_label()
+        shutdown = {"user": "operator", "time": "12:30"}
+        encoded_logs = json.dumps({"local_shutdown": shutdown, "local_flash": {"port_down": 0}})
+        label["semantic_labels"]["anomaly_logs"] = encoded_logs
+        engine = fake_engine(select_shutdown)
+        inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
+        with tempfile.TemporaryDirectory() as root:
+            row, = inference.infer_results([label], "接口状态DOWN", root)
+
+        self.assertEqual(row["status"], "success")
+        planner = engine.llm.requests[0][1]
+        log_fields = {entry["key"]: entry for entry in planner["semantic_labels_template"]["log"]}
+        self.assertTrue(log_fields[key]["available"])
+        expert = engine.llm.requests[1][1]
+        self.assertEqual(expert["log_data"], {"anomaly_logs": {"local_shutdown": shutdown}})
+        self.assertEqual(expert["missing_focus_keys"], [])
+        self.assertEqual(label["semantic_labels"]["anomaly_logs"], encoded_logs)
+
     def test_cooperation_keeps_only_latest_opinion_and_reserves_aggregator(self):
         def review_opinion(instruction, payload):
             if "opinion_pool" in payload and not instruction.startswith("你是 Aggregator"):
@@ -493,6 +520,10 @@ class LlmInterfaceTests(unittest.TestCase):
             )
             rows = evaluate(args)
             self.assertTrue((output_dir / "metrics.csv").is_file())
+            trace = output_dir / "traces" / "场景A" / "cooperation" / "场景A" / "case_000000"
+            result = json.loads((trace / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(Path(result["label_file_path"]), label_root / "场景A" / "场景A_0_label_sample.json")
+            self.assertNotIn("label_file_path", (trace / "orchestrator/prompt.txt").read_text(encoding="utf-8"))
         get_instance.assert_called_once()
         totals = [row for row in rows if row["alarm_type"] is None]
         self.assertEqual([row["attempted_count"] for row in totals], [2, 2])

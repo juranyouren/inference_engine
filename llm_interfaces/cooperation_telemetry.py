@@ -39,6 +39,21 @@ def has_telemetry(value):
     return value is not None
 
 
+def normalize_telemetry(labels):
+    """兼容以 JSON 字符串存储的遥测容器。"""
+    normalized = dict(labels)
+    for field in ("anomaly_logs", "anomaly_kpi", "anomaly_netstreams", "other_info"):
+        raw = normalized.get(field)
+        if not isinstance(raw, str) or not raw.lstrip().startswith(("{", "[")):
+            continue
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        normalized[field] = decoded
+    return normalized
+
+
 def semantic_labels_template(labels):
     base = _base_template()
     root_roles = {

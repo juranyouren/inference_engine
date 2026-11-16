@@ -95,6 +95,8 @@ class AgentInference:
             "ttm": None, "final_result": None, "error": None,
             **prediction_fields([], "", "unparsed"),
         }
+        if isinstance(label, dict) and "_label_file_path" in label:
+            result["label_file_path"] = label["_label_file_path"]
         try:
             case = normalize_case(label, input_index=index, mode=self.mode, alarm_type=alarm_type)
             result.update(case_id=case.case_id, timestamp=case.alarm_time,
