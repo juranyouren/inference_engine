@@ -244,19 +244,21 @@ class LlmInterfaceTests(unittest.TestCase):
             self.assertEqual(expert["specialist"], row["personas"]["log"])
             self.assertEqual(expert["log_data"], {"anomaly_logs": {"local_flash": {"port_down": 0}}})
 
-    def test_cooperation_rejects_focus_from_another_telemetry_group(self):
+    def test_cooperation_skips_focus_from_another_telemetry_group(self):
         def invalid_persona(instruction, payload):
             answer = default_answer(instruction, payload)
-            answer["log"]["focus"] = [{"key": "/anomaly_kpi", "desc": "检查 KPI"}]
+            if instruction.startswith("你是 Orchestrator"):
+                answer["log"]["focus"] = [{"key": "/anomaly_kpi", "desc": "检查 KPI"}]
             return answer
 
         engine = fake_engine(invalid_persona)
         inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
         with tempfile.TemporaryDirectory() as root:
             row, = inference.infer_results([cooperation_label()], "场景", root)
-        self.assertEqual(row["status"], "failed")
-        self.assertIn("该类别", row["error"])
-        self.assertEqual(len(engine.llm.requests), 1)
+        self.assertEqual(row["status"], "success")
+        self.assertTrue(any("/anomaly_kpi" in issue for issue in row["orchestrator_issues"]))
+        self.assertNotIn("/anomaly_kpi", {item["key"] for item in row["personas"]["log"]["focus"]})
+        self.assertTrue(any("log_data" in payload for _, payload in engine.llm.requests))
 
     def test_cooperation_selects_leaf_values_inside_arrays(self):
         key = "/anomaly_kpi/offline_loss_rate/abnormal_timing_segments/*/value/*"
@@ -420,7 +422,7 @@ class LlmInterfaceTests(unittest.TestCase):
         label["semantic_labels"] = {"anomaly_logs": {}, "anomaly_kpi": {"value": [None, " "]}}
 
         def omit_unavailable_personas(instruction, payload):
-            return {}
+            return {} if instruction.startswith("你是 Orchestrator") else default_answer(instruction, payload)
 
         engine = fake_engine(omit_unavailable_personas)
         inference = CooperationInference(engine, sampling_params_factory=fake_sampling_params)
@@ -428,9 +430,10 @@ class LlmInterfaceTests(unittest.TestCase):
             row, = inference.infer_results([label], "场景", root)
             saved = json.loads((Path(row["output_dir"]) / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["stop_reason"], "insufficient_evidence")
-        self.assertEqual(saved["predicted_list_v1"], [])
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(saved["predicted_list_v1"], [item["category"] for item in label["root_cause_candidates"]])
         self.assertEqual(set(saved["skipped_specialists"]), {"log", "metadata", "time_series"})
-        self.assertEqual(len(engine.llm.requests), 1)
+        self.assertEqual(len(engine.llm.requests), 2)
 
     def test_nested_groundtruth_is_scored_but_never_sent_to_agents(self):
         sentinel = "EVALUATION_ONLY_PRIVATE_ANNOTATION"
@@ -601,7 +604,7 @@ class LlmInterfaceTests(unittest.TestCase):
             self.assertTrue((output_dir / "metrics.csv").is_file())
             trace = output_dir / "traces" / "场景A" / "cooperation" / "场景A" / "case_000000"
             result = json.loads((trace / "result.json").read_text(encoding="utf-8"))
-            self.assertEqual(Path(result["label_file_path"]), label_root / "场景A" / "场景A_0_label_sample.json")
+            self.assertEqual(Path(result["label_file_path"]), (label_root / "场景A" / "场景A_0_label_sample.json").resolve())
             self.assertNotIn("label_file_path", (trace / "orchestrator/prompt.txt").read_text(encoding="utf-8"))
         get_instance.assert_called_once()
         totals = [row for row in rows if row["alarm_type"] is None]

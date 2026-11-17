@@ -41,6 +41,13 @@ def read_sop(label: Dict[str, Any]) -> str:
     return _sop_to_text(labels.get("sop")) if isinstance(labels, dict) else ""
 
 
+def with_top_level_sop(label: Dict[str, Any]) -> Dict[str, Any]:
+    labels = label.get("semantic_labels")
+    if isinstance(labels, dict) and not read_sop(label):
+        return {**label, "semantic_labels": {**labels, "sop": label.get("sop")}}
+    return label
+
+
 def without_sop(label: Dict[str, Any]) -> Dict[str, Any]:
     labels = label.get("semantic_labels")
     if not isinstance(labels, dict):

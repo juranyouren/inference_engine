@@ -93,32 +93,62 @@ class CooperationInference(AgentInference):
         super().__init__(engine, **kwargs)
 
     @staticmethod
-    def _personas(response, template):
-        personas = response_json(response)
-        if not isinstance(personas, dict) or not personas.keys() <= SPECIALISTS.keys():
-            raise ValueError("Orchestrator 必须为 log、time_series、metadata 各生成一个 persona")
+    def _personas(response, template, issues=None):
+        """尽量修复 Orchestrator 计划，避免单个 focus 错误中断 case。"""
+        issues = issues if issues is not None else []
+        try:
+            personas = response_json(response)
+        except (ValueError, TypeError) as exc:
+            issues.append(f"Orchestrator JSON 无法解析，已回退到各类别全部可用遥测: {exc}")
+            personas = {}
+        if not isinstance(personas, dict):
+            issues.append("Orchestrator 输出不是对象，已回退到各类别全部可用遥测")
+            personas = {}
+
+        normalized = {}
         for role in SPECIALISTS:
             specialist = personas.get(role)
-            if specialist is None and not any(item["available"] for item in template[role]):
-                personas[role] = {"persona": f"{role} 专家暂无可用遥测", "focus": []}
-                continue
-            if not isinstance(specialist, dict) or specialist.keys() != {"persona", "focus"}:
-                raise ValueError(f"{role} 专家必须包含 persona 和 focus")
-            persona, focus = specialist["persona"], specialist["focus"]
-            if not isinstance(persona, str) or not persona.strip() or not isinstance(focus, list):
-                raise ValueError(f"{role} 专家需要角色说明和关注点列表")
-            allowed = {item["key"] for item in template[role]}
+            if not isinstance(specialist, dict):
+                issues.append(f"{role} persona 缺失或格式错误，已使用默认角色和遥测范围")
+                specialist = {}
+            persona = specialist.get("persona")
+            if not isinstance(persona, str) or not persona.strip():
+                persona = f"{role} 遥测分析专家，检查相关证据并判断告警根因。"
+
+            raw_focus = specialist.get("focus")
+            if not isinstance(raw_focus, list):
+                issues.append(f"{role} focus 格式错误，已使用全部可用遥测")
+                raw_focus = []
+            allowed = {item["key"]: item for item in template[role]}
             selected = set()
-            for detail in focus:
-                if not isinstance(detail, dict) or detail.keys() != {"key", "desc"}:
-                    raise ValueError(f"{role} 的关注点必须包含 key 和 desc")
-                key, desc = detail["key"], detail["desc"]
-                if not isinstance(key, str) or key not in allowed or key in selected:
-                    raise ValueError(f"{role} 的关注点必须使用该类别中互不重复的模板 key")
+            focus = []
+            for detail in raw_focus:
+                if not isinstance(detail, dict):
+                    issues.append(f"{role} 有格式错误的关注点，已忽略")
+                    continue
+                key = detail.get("key")
+                if not isinstance(key, str) or key not in allowed:
+                    issues.append(f"{role} 有模板中不存在的 key，已忽略: {key}")
+                    continue
+                if key in selected:
+                    issues.append(f"{role} 有重复 key，已合并: {key}")
+                    continue
+                desc = detail.get("desc")
                 if not isinstance(desc, str) or not desc.strip():
-                    raise ValueError(f"{role} 的关注点必须有具体检查说明")
+                    desc = allowed[key].get("desc") or f"检查遥测字段 {key}。"
+                focus.append({"key": key, "desc": desc.strip()})
                 selected.add(key)
-        return personas
+
+            available = [item for item in template[role] if item["available"]]
+            if not focus or not any(item["key"] in {entry["key"] for entry in available} for item in focus):
+                if available:
+                    issues.append(f"{role} 没有可用的有效关注点，已回退到全部可用遥测")
+                    focus = [
+                        {"key": item["key"], "desc": item["desc"]}
+                        for item in available
+                    ]
+            normalized[role] = {"persona": persona, "focus": focus}
+        return normalized
 
     @staticmethod
     def _opinion(response, candidates, role, round_index):
@@ -158,7 +188,7 @@ class CooperationInference(AgentInference):
         result.update(
             opinion_pool=[], invoke_limit=self.invoke_limit, agent_invocations=0,
             round_count=0, early_stopped=False, rounds=[],
-            skipped_specialists={}, specialist_issues=[],
+            skipped_specialists={}, specialist_issues=[], orchestrator_issues=[],
         )
 
         def invoke(requests, *, allow_empty_responses=False):
@@ -177,8 +207,8 @@ class CooperationInference(AgentInference):
             "incident_type_description": incident_description,
             "root_cause_candidates": candidate_details,
             "semantic_labels_template": template,
-        })])
-        personas = self._personas(plan, template)
+        })], allow_empty_responses=True)
+        personas = self._personas(plan, template, result["orchestrator_issues"])
         result["personas"] = personas
         specialist_data = {}
         for role, group in SPECIALISTS.items():
@@ -226,29 +256,30 @@ class CooperationInference(AgentInference):
                 (f"round0/{role}", SPECIALIST_PROMPT + OPINION_PROMPT, specialist_data[role])
                 for role in roles
             ], allow_empty_responses=True)
-            collect_opinions(initial, roles, 0)
+            if collect_opinions(initial, roles, 0):
+                result["early_stopped"] = True
+
         if not latest:
             result["stop_reason"] = "insufficient_evidence"
-            raise ValueError("没有专家能够根据可用遥测形成根因意见")
+        else:
+            while result["agent_invocations"] < self.invoke_limit - 1:
+                remaining = self.invoke_limit - result["agent_invocations"] - 1
+                active = roles[:remaining]
+                round_index = result["round_count"]
+                snapshot = result["opinion_pool"]
+                answers = invoke([
+                    (
+                        f"round{round_index}/{role}",
+                        SPECIALIST_PROMPT + REVIEW_PROMPT + OPINION_PROMPT,
+                        {**specialist_data[role], "opinion_pool": snapshot},
+                    )
+                    for role in active
+                ], allow_empty_responses=True)
+                if collect_opinions(answers, active, round_index) and len(active) == len(roles):
+                    result["early_stopped"] = True
+                    break
 
-        while result["agent_invocations"] < self.invoke_limit - 1:
-            remaining = self.invoke_limit - result["agent_invocations"] - 1
-            active = roles[:remaining]
-            round_index = result["round_count"]
-            snapshot = result["opinion_pool"]
-            answers = invoke([
-                (
-                    f"round{round_index}/{role}",
-                    SPECIALIST_PROMPT + REVIEW_PROMPT + OPINION_PROMPT,
-                    {**specialist_data[role], "opinion_pool": snapshot},
-                )
-                for role in active
-            ], allow_empty_responses=True)
-            if collect_opinions(answers, active, round_index) and len(active) == len(roles):
-                result["early_stopped"] = True
-                break
-
-        result["stop_reason"] = "all_no_comment" if result["early_stopped"] else "invoke_limit"
+            result["stop_reason"] = "all_no_comment" if result["early_stopped"] else "invoke_limit"
         answer, = invoke([
             ("aggregator", AGGREGATOR_PROMPT, {
                 **context, "opinion_pool": result["opinion_pool"],

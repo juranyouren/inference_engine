@@ -12,7 +12,7 @@ import config
 from inference.common import discover_label_index_map
 from inference.metrics import calculate_metrics
 
-from .data_adapter import read_sop, without_sop
+from .data_adapter import read_sop, with_top_level_sop, without_sop
 from .io_utils import safe_category_name, save_json
 from .main import configure_ascend_devices, load_json_case
 
@@ -44,9 +44,8 @@ def load_groups(
             if not assigned and limit_per_mode is None:
                 continue
             label = load_json_case(path)
-            labels = label.get("semantic_labels")
-            if import_top_level_sop and isinstance(labels, dict) and not read_sop(label):
-                label = {**label, "semantic_labels": {**labels, "sop": label.get("sop")}}
+            if import_top_level_sop:
+                label = with_top_level_sop(label)
             if require_sop and not read_sop(label):
                 excluded_without_sop += int(assigned)
                 continue

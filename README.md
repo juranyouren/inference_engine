@@ -1,200 +1,46 @@
-# inference_engine
+# RCA 推理评测
 
-当前工程用于增量处理两个 label 根目录：
+以下命令在仓库根目录运行。数据集根目录的直接子目录按告警类别发现，样本按文件名中的数字 index 排序，例如 `网络设备掉线_50_label_10475196.json`。
 
-- `AgentDigest_label/<告警类别>/`：LLM 推理
-- `anomalydetect_label/<告警类别>/`：Tree 推理
-
-## 默认行为
+## 只运行 Competition 和 Cooperation
 
 ```bash
-cd /home/sbp/deployment/inference_engine
-python infer_by_index.py
+python run_agent_evaluation.py \
+  --label-root /path/to/dataset \
+  --import-top-level-sop \
+  --output-dir res/agent_evaluation
 ```
-
-默认 `--infer-type all`，Tree 和 LLM 使用两个独立 `spawn` 进程顺序执行。
-
-## LLM 自动分流
-
-- `semantic_labels["sop"]` 非空时使用竞争型，各候选根因分别评估 SOP 路径，再由 Verifier 排序。
-- `semantic_labels["sop"]` 为空时使用合作型，三位专家共享意见池，再由 Aggregator 汇总。`--invoke-limit` 默认是 10。
-
-两个模式使用同一个模型实例。运行示例及评测命令见 [LLM 接口说明](llm_interfaces/README.md)。
-
-## 增量状态
-
-状态文件默认：
-
-`/home/sbp/deployment/case_pool/predict_result/state/infer_state.json`
-
-每个类别目录分别维护 `tree_infer.last_index` 与 `llm_infer.last_index`。只有连续成功的新增 index 才推进 checkpoint。
-
-## 常用命令
 
 ```bash
-# 默认：Tree + LLM
-python infer_by_index.py
-
-# 只跑 LLM
-python infer_by_index.py --infer-type llm_infer
-
-# 只跑 Tree
-python infer_by_index.py --infer-type tree_infer
-
-# 只处理一个类别
-python infer_by_index.py --scenario 网络设备掉线
-
-# 小批量新增测试
-python infer_by_index.py --max-new-cases 2
-
-# 手动窗口调试（不更新 state）
-python infer_by_index.py --start 60 --end 62
+bash run_agent_evaluation_parallel.sh \
+  --label-root /path/to/dataset \
+  --output-dir res/agent_evaluation_parallel
 ```
 
-## Ascend / vLLM
+并行入口默认使用 8 张卡，每两张卡运行一个分片。两个入口均支持 `--limit-per-mode N`。这套评测的 `both` 模式对同一批带 SOP 的样本运行两个 Agent，Cooperation 的输入会移除 SOP。详细参数见 [LLM 接口说明](llm_interfaces/README.md)。
 
-工程入口会在任何 vLLM/torch_npu 初始化前设置：
-
-`VLLM_WORKER_MULTIPROC_METHOD=spawn`
-
-请保留 `if __name__ == "__main__": main()`。
-
-## 说明
-
-`infer_by_index.py` 当前只保留 CLI、运行时初始化和进程调度。公共增量逻辑在 `inference/common.py`，Selection/Selector/Refiner 在 `inference/selection.py`，Tree 主流程在 `inference/tree.py`，LLM 主流程在 `inference/llm.py`。
-
-`rule_inferencer/txt2sop.py` 当前是兼容接口版本；Tree 主流程不依赖它生成最终预测。
-
-## 三种方法对比实验
-
-下面的三方法实验保留历史 LLM 流程用于结果复现。新 Agent 流程使用 `python run_agent_evaluation.py --label-root /path/to/label_root` 评测。
-
-独立实验入口不会修改生产增量状态。它会动态扫描类别目录，分别运行 Tree、
-Competition、Cooperation，并把 Top-1/3/5、MRR、平均耗时写入
-`evaluation/metrics.json` 和 `evaluation/metrics.csv`。
+## 每类前 50 条训练，接下来的 150 条测试
 
 ```bash
-cd /home/sbp/deployment/inference_engine
-python run_three_method_experiment.py \
-  --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
+bash run_all_inference_modes.sh \
+  /path/to/dataset \
+  res/fixed_split \
+  /path/to/selections \
+  --ascend-devices 6,7 --import-top-level-sop
 ```
 
-只重跑 Tree 并启用根因重排 val：
+Tree 用每类前 50 条训练一次。Tree 和 Cooperation 使用接下来的 150 条测试，Competition 使用其中有 SOP 的样本，其余计入 `skipped_count`。两个 Agent 共用同一个 LLM 实例。SOP 已在 `semantic_labels.sop` 时可省略 `--import-top-level-sop`。
+
+Tree 从 selection 目录下的 `<类别>/selection.json` 读取特征配置，也可直接指定一个 selection 文件。省略 selection 路径时从数据集目录查找。各模式的预测、明细和指标写入 `res/fixed_split/<mode>/`，整体指标写入输出根目录。
+
+使用 Python 入口可以单独运行某个模式，例如 `--mode tree`：
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python run_three_method_experiment.py \
-  --methods tree --tree-val \
-  --tree-val-rule-root /home/sbp/huangzeshun/RCA_Units/rt2feature \
-  --tree-val-template-dir /home/sbp/huangzeshun/RCA_Units/template \
-  --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/tree_val
+python run_tree_agent_evaluation.py \
+  --dataset-root /path/to/dataset \
+  --mode tree \
+  --selection-path /path/to/selections \
+  --output-dir res/fixed_split
 ```
 
-`--tree-val` 会在 Tree 原始预测后，根据场景规则和重新提取的特征对候选根因
-进行重排。原始 `pred_rc` 和重排后的 `pred_rc_val` 会同时保存；生产增量推理默认关闭。
-
-快速验证时可让三种方法在每个类别上只评测 5 个 case。默认使用索引 51–55；
-Tree 另外使用索引 1–50 训练，但只对这 5 个 case 计时和评分：
-
-```bash
-python run_three_method_experiment.py --test
-```
-
-未显式指定 `--output-dir` 时，测试结果写入默认实验目录的 `test_5/` 子目录。
-
-三种方法统一读取 `anomalydetect_label`，默认校验 4 个类别，并严格使用每类
-索引 51–250（含首尾）的 200 条数据。Tree 使用 51–100 初始化，依次测试
-101–150、151–200、201–250，并在每轮加入已测试数据重新训练。每个 Tree 阶段均开启完整的
-Selector -> Refiner -> Tree 流程，产物分别保存在 `tree/selector/`、
-`tree/refiner/`、`tree/tree/`；两种 LLM 方法分别运行全部 200 条。
-三个方法使用独立 spawn 进程，避免 NPU 模型运行时相互污染。
-所有实际送入模型的 prompt 均会保存：Selector/Refiner 使用 `prompt_0.txt`，
-Competition 三路初始推理使用 `prompt_Reasoner1.txt`、`prompt_Reasoner2.txt`、
-`prompt_Reasoner3.txt`，其余 Meta/Reasoner/Verifier 阶段在各自输出目录使用
-`prompt.txt`。Prompt 超出模型输入预算时，会优先把 `anomaly_logs` 替换为保留
-首尾内容的结构化截断摘要，确保任务说明、SOP、候选根因和输出格式仍完整；只有
-压缩日志后依然超限，才对整个 Prompt 使用首尾截断兜底。落盘的是最终实际送入
-模型的版本。
-
-Tree 的每条预测包含 `cot`，记录样本从根节点到叶节点实际经过的判断条件及
-最终叶子类别编号，例如：
-
-```json
-{
-  "cot": {
-    "feature_a <= 1.00 -> feature_b > 0.50": 5
-  }
-}
-```
-
-已有推理结果可只重新评测：
-
-```bash
-python run_three_method_experiment.py --evaluate-only --output-dir /path/to/experiment
-```
-
-## 按 CSN 补充 root_cause
-
-`fill_root_cause_by_csn.py` 从另一个相同类别目录结构的 label 根目录读取
-`root_cause`，按 `XXX_<idx>_label_<csn>.json` 文件名中的 CSN 匹配并补充到
-`anomalydetect_label`。默认只生成预演报告，不修改 label：
-
-```bash
-python fill_root_cause_by_csn.py /path/to/source_label_root
-```
-
-确认 `anomalydetect_label/root_cause_fill_report.json` 后实际写入并备份：
-
-```bash
-python fill_root_cause_by_csn.py /path/to/source_label_root \
-  --apply \
-  --backup-dir /path/to/root_cause_backup
-```
-
-来源中同一 CSN 对应不同根因、目标缺少 CSN、没有匹配项时不会写入对应文件，
-并默认返回非零退出码。
-
-## 重新解析并评分 LLM 结果
-
-模型已经跑完但部分结果未正确解析时，不需要重新推理：
-
-```bash
-python reparse_and_score_llm_results.py \
-  --experiment-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
-```
-
-首次实验和重新解析使用同一套策略：Competition 只解析最终 Verifier；
-Cooperation 只解析最后一轮 Meta。结构化数组解析失败后，才按最终回答中的
-候选根因出现顺序进行文本兜底，不向其他输出或更早轮次回溯。新结果写入实验目录下的
-`reparsed/`，不会覆盖原始结果，其中 `parse_attempts` 记录每个 case 尝试过的
-回答文件。重新计算的 Top-1/3/5、MRR 和平均时间位于
-`reparsed/evaluation/metrics.json` 与 `metrics.csv`。
-
-仍有少量 case 无法解析时，只重跑这些失败项：
-
-```bash
-python rerun_failed_llm_cases.py \
-  --experiment-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods
-```
-
-脚本默认只选择 `pred_rc` 为空或 `parse_strategy=unparsed` 的 case；添加
-`--rerun-text-fallback` 可同时重跑低置信度文本兜底结果。原始结果不会被覆盖：
-单独重跑结果位于 `rerun_failed/`，替换失败项后的完整结果和总体评分位于
-`reparsed_after_rerun/`。
-
-## LLM 已有结果重排
-
-不重新调用大模型，直接加载已有 `competition/predictions.json` 和 `cooperation/predictions.json`，映射 `groundtruth -> rc` 后调用共享 val 函数：
-
-```bash
-python rerank_llm_results.py \
-  --experiment-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods \
-  --methods competition cooperation \
-  --label-root /home/sbp/deployment/case_pool/AgentDigest_label \
-  --tree-val-rule-root /home/sbp/huangzeshun/RCA_Units/rt2feature \
-  --tree-val-template-dir /home/sbp/huangzeshun/RCA_Units/template \
-  --output-dir /home/sbp/deployment/case_pool/predict_result/experiments/three_methods/llm_reranked
-```
-
-Tree 的 val 只在 `run_three_method_experiment.py` 中串联，`inference/tree.py` 保持纯 Tree 推理；输出同时保留原始 `pred_rc/rank` 和重排后的 `pred_rc_val/rank_val`。
-
-重排脚本会生成 `evaluation/metrics.json` 和 `evaluation/metrics.csv`，分别给出 raw/val 的 Top-1、Top-3、Top-5、MRR、总耗时和平均每 case 耗时；val 行还会单独记录 `rerank_elapsed_seconds`。
+两套评测均独立于生产增量入口 `infer_by_index.py`，评测过程不读写增量状态。
