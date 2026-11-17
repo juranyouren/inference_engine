@@ -165,8 +165,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=getattr(config, "DEFAULT_LLM_MODE", "auto"),
         help=(
             "默认 auto：semantic_labels['sop'] 非空走 competition，"
-            "为空走 cooperation。Competition=多采样+Verifier；"
-            "Cooperation=多轮 Meta/Reasoner。"
+            "为空走 cooperation。Competition=候选诊断路径与 Verifier。"
+            "Cooperation=专家意见池与 Aggregator。"
         ),
     )
 
@@ -178,10 +178,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--invoke-limit",
+        type=int,
+        default=10,
+        help="合作型每个 case 的总 Agent 调用上限，包含 Orchestrator 和 Aggregator。",
+    )
+
+    parser.add_argument(
         "--max-rounds",
         type=int,
         default=getattr(config, "LLM_COOPERATION_MAX_ROUNDS", 5),
-        help="Cooperation 最大 Meta/Reasoner 迭代轮数。",
+        help="兼容参数，用于进一步限制合作型的复评轮数。",
     )
 
     # 输出

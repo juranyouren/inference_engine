@@ -400,6 +400,12 @@ def _get_semantic_labels(label_data: Dict[str, Any]) -> Dict[str, Any]:
     return semantic_labels if isinstance(semantic_labels, dict) else {}
 
 
+def semantic_labels_for_prompt(semantic_labels: Any) -> Any:
+    if isinstance(semantic_labels, dict):
+        return {key: value for key, value in semantic_labels.items() if key != "root_cause"}
+    return semantic_labels
+
+
 def _get_sop(label_data: Dict[str, Any]) -> str:
     semantic_labels = _get_semantic_labels(label_data)
     sop = semantic_labels.get("sop", label_data.get("sop", ""))

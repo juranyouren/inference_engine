@@ -16,8 +16,10 @@ python infer_by_index.py
 
 ## LLM 自动分流
 
-- `semantic_labels["sop"]` 非空 -> Competition：多采样推理 + Verifier
-- `semantic_labels["sop"]` 为空 -> Cooperation：多轮 Meta/Reasoner，直到早停或 `--max-rounds`
+- `semantic_labels["sop"]` 非空时使用竞争型，各候选根因分别评估 SOP 路径，再由 Verifier 排序。
+- `semantic_labels["sop"]` 为空时使用合作型，三位专家共享意见池，再由 Aggregator 汇总。`--invoke-limit` 默认是 10。
+
+两个模式使用同一个模型实例。运行示例及评测命令见 [LLM 接口说明](llm_interfaces/README.md)。
 
 ## 增量状态
 
@@ -64,6 +66,8 @@ python infer_by_index.py --start 60 --end 62
 `rule_inferencer/txt2sop.py` 当前是兼容接口版本；Tree 主流程不依赖它生成最终预测。
 
 ## 三种方法对比实验
+
+下面的三方法实验保留历史 LLM 流程用于结果复现。新 Agent 流程使用 `python run_agent_evaluation.py --label-root /path/to/label_root` 评测。
 
 独立实验入口不会修改生产增量状态。它会动态扫描类别目录，分别运行 Tree、
 Competition、Cooperation，并把 Top-1/3/5、MRR、平均耗时写入

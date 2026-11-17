@@ -28,22 +28,6 @@ from inference.common import (
 # ============================================================
 
 
-def _lazy_import_llm_modules():
-    from llm_inference.generator import RCAGenerator
-    from utils.public_functions import (
-        load_alarm_data_meta,
-        load_alarm_data_reasoner_cooperation,
-        load_alarm_data_verifier,
-    )
-
-    return (
-        RCAGenerator,
-        load_alarm_data_meta,
-        load_alarm_data_reasoner_cooperation,
-        load_alarm_data_verifier,
-    )
-
-
 def llm_find_case_and_label(
     data_dir: str,
     alarm_type: str,
@@ -574,129 +558,124 @@ def llm_cooperation_one_scenario(
     return payload
 
 
+def _run_agent_scenario(inference, scenario, jobs, args):
+    indices = [index for index, _case_file, _label_file, _label in jobs]
+    run_name = f"idx_{min(indices)}_{max(indices)}"
+    output_dir = build_output_dir(
+        f"llm_infer_{inference.mode}", scenario["name"], args.output_dir, run_name,
+    )
+    results = inference.infer_results(
+        [label for _index, _case_file, _label_file, label in jobs],
+        scenario["alarm_type"],
+        output_dir,
+        case_indices=indices,
+    )
+    predictions = []
+    for result, (_index, case_file, label_file, _label) in zip(results, jobs):
+        ranking = result["predicted_list_v1"]
+        predictions.append({
+            **result, "alarm_type": scenario["alarm_type"], "alarm_time": result["timestamp"],
+            "case_file_path": case_file, "label_file_path": label_file,
+            "pred_top1_rc": ranking[0] if ranking else None, "pred_rc": ranking,
+            "rank": result["rank_v1"], "is_correct": result["rank_v1"] == 1,
+        })
+    processed = [item["case_idx"] for item in results if item["status"] == "success"]
+    skipped = [item["case_idx"] for item in results if item["status"] == "failed"]
+    payload = {
+        "meta": {
+            "mode": "llm_infer", "llm_mode": inference.mode, "pipeline": "agents",
+            "scenario_name": scenario["name"], "alarm_type": scenario["alarm_type"],
+            "data_dir": scenario["data_dir"], "indices": indices,
+            "batch_size": inference.batch_size, "model_path": config.MODEL_PATH,
+            "output_dir": output_dir,
+        },
+        "summary": {
+            "processed_count": len(processed), "skipped_count": len(skipped),
+            "processed_indices": processed, "skipped_indices": skipped,
+        },
+        "results": predictions,
+    }
+    save_infer_outputs(payload, output_dir, args.output_format)
+    if skipped and args.strict:
+        first_failure = next(item for item in results if item["status"] == "failed")
+        raise ValueError(f"case {first_failure['case_idx']}: {first_failure['error']}")
+    return payload
+
+
 def llm_infer(args: argparse.Namespace) -> List[Dict[str, Any]]:
-    scenarios = scan_label_root(
-        args.agentdigest_label_root,
-        args.scenario,
-    )
-
-    batch_size = (
-        args.batch_size
-        if args.batch_size is not None
-        else getattr(config, "BATCH_SIZE", 8)
-    )
-
+    scenarios = scan_label_root(args.agentdigest_label_root, args.scenario)
+    batch_size = args.batch_size if args.batch_size is not None else config.BATCH_SIZE
     state = load_infer_state(args.state_file)
     plans = []
 
     for scenario in scenarios:
         indices, should_update_state, previous_last_index = get_incremental_indices(
-            scenario=scenario,
-            mode="llm_infer",
-            args=args,
-            state=state,
+            scenario=scenario, mode="llm_infer", args=args, state=state,
         )
-        if not indices:
-            print(f"[llm_infer] {scenario['name']} 没有新增数据，跳过")
-            continue
-        plans.append((scenario, indices, should_update_state, previous_last_index))
+        if indices:
+            plans.append((scenario, indices, should_update_state, previous_last_index))
 
     if not plans:
         return []
 
-    (
-        RCAGenerator,
-        load_alarm_data_meta,
-        load_alarm_data_reasoner_cooperation,
-        load_alarm_data_verifier,
-    ) = _lazy_import_llm_modules()
-    rca_generator = RCAGenerator(getattr(config, "MODEL_PATH"))
+    from llm_interfaces.competition import CompetitionInference
+    from llm_interfaces.cooperation import CooperationInference
+    from llm_interfaces.data_adapter import read_sop, without_sop
+    from llm_interfaces.llm_engine import LLMEngine
+
+    engine = LLMEngine.get_instance(model_path=config.MODEL_PATH)
+    modes = {
+        "competition": CompetitionInference(
+            engine, batch_size=batch_size, prompt_safety_tokens=config.LLM_PROMPT_SAFETY_TOKENS,
+        ),
+        "cooperation": CooperationInference(
+            engine, batch_size=batch_size, prompt_safety_tokens=config.LLM_PROMPT_SAFETY_TOKENS,
+            invoke_limit=getattr(args, "invoke_limit", 10), max_rounds=getattr(args, "max_rounds", None),
+        ),
+    }
 
     payloads = []
-
     for scenario, indices, should_update_state, previous_last_index in plans:
-        if args.llm_mode == "competition":
-            competition_indices = list(indices)
-            cooperation_indices = []
-        elif args.llm_mode == "cooperation":
-            cooperation_indices = list(indices)
-            competition_indices = []
-        else:
-            cooperation_indices, competition_indices = split_indices_by_sop(
-                scenario["data_dir"],
-                scenario["alarm_type"],
-                indices,
-            )
-
-        print("=" * 100)
-        print(f"[llm_infer][incremental] 场景: {scenario['name']}")
-        print(f"data_dir          : {scenario['data_dir']}")
-        print(f"indices           : {indices}")
-        print(f"llm_mode          : {args.llm_mode}")
-        print("full_pipeline     : True")
-        print(
-            "cooperation count : "
-            f"{len(cooperation_indices)}，条件：semantic_labels['sop'] 为空"
-        )
-        print(
-            "competition count : "
-            f"{len(competition_indices)}，条件：semantic_labels['sop'] 非空"
-        )
-        print("=" * 100)
-
-        scenario_payloads = []
-        success_indices: Set[int] = set()
-
         try:
-            if cooperation_indices:
-                payload = llm_cooperation_one_scenario(
-                    scenario=scenario,
-                    indices=cooperation_indices,
-                    rca_generator=rca_generator,
-                    load_alarm_data_meta=load_alarm_data_meta,
-                    load_alarm_data_reasoner_cooperation=load_alarm_data_reasoner_cooperation,
-                    output_dir=args.output_dir,
-                    output_format=args.output_format,
-                    batch_size=batch_size,
-                    max_rounds=args.max_rounds,
-                )
-                scenario_payloads.append(payload)
-                success_indices.update(
-                    payload.get("summary", {}).get("processed_indices", [])
-                )
+            reader = IndexedCaseReader(scenario["data_dir"], scenario["alarm_type"])
+            jobs = {"competition": [], "cooperation": []}
+            for idx in indices:
+                try:
+                    case_file, label_file = reader.find_case_and_label_path(idx)
+                    label = load_json(label_file)
+                    if not isinstance(label, dict):
+                        raise ValueError("label 必须是 JSON 对象")
+                except (OSError, ValueError) as exc:
+                    print(f"[llm_infer] {scenario['name']} idx={idx} 读取失败: {exc}")
+                    if args.strict:
+                        raise
+                    continue
 
-            if competition_indices:
-                payload = llm_competition_one_scenario(
-                    scenario=scenario,
-                    indices=competition_indices,
-                    rca_generator=rca_generator,
-                    load_alarm_data_verifier=load_alarm_data_verifier,
-                    output_dir=args.output_dir,
-                    output_format=args.output_format,
-                    batch_size=batch_size,
-                )
-                scenario_payloads.append(payload)
-                success_indices.update(
-                    payload.get("summary", {}).get("processed_indices", [])
-                )
+                mode = args.llm_mode
+                if mode == "auto":
+                    mode = "competition" if read_sop(label) else "cooperation"
+                elif mode == "cooperation":
+                    label = without_sop(label)
+                jobs[mode].append((idx, case_file, label_file, label))
 
-            payloads.extend(scenario_payloads)
+            success_indices: Set[int] = set()
+            for mode, batch in jobs.items():
+                if not batch:
+                    continue
+                payload = _run_agent_scenario(modes[mode], scenario, batch, args)
+                payloads.append(payload)
+                success_indices.update(payload["summary"]["processed_indices"])
 
             if should_update_state:
                 new_checkpoint = advance_checkpoint(
-                    selected_indices=indices,
-                    success_indices=success_indices,
+                    selected_indices=indices, success_indices=success_indices,
                     previous_last_index=previous_last_index,
                 )
                 if new_checkpoint > previous_last_index:
                     update_last_processed_index(
-                        state=state,
-                        mode="llm_infer",
-                        scenario=scenario,
-                        last_index=new_checkpoint,
+                        state=state, mode="llm_infer", scenario=scenario, last_index=new_checkpoint,
                     )
                     save_infer_state(state, args.state_file)
-
         except Exception as exc:
             print(f"[Error][llm_infer] {scenario['name']} 处理失败: {exc}")
             traceback.print_exc()

@@ -18,6 +18,7 @@ from utils.public_functions import (
     fit_prompt_to_token_budget,
     save_json,
     save_jsonl,
+    semantic_labels_for_prompt,
     vllm_invoke,
 )
 from llm_inference.prompts import ROLE_PROMPTS
@@ -157,7 +158,10 @@ class Selector(RCARole):
         for case in case_list:
             inputs.append(self.prompt.format(
                 alarm_type=case.get("alarm_type", ""),
-                semantic_labels=json.dumps(case.get("semantic_labels", {}), ensure_ascii=False, indent=2),
+                semantic_labels=json.dumps(
+                    semantic_labels_for_prompt(case.get("semantic_labels", {})),
+                    ensure_ascii=False, indent=2,
+                ),
                 alarm_time=case.get("alarm_time", ""),
                 sop=case.get("sop", ""),
                 root_cause_candidates=json.dumps(case.get("root_cause_candidates", []), ensure_ascii=False, indent=2),
@@ -204,7 +208,10 @@ class Refiner(RCARole):
         for case in case_list:
             inputs.append(self.prompt.format(
                 alarm_type=case.get("alarm_type", ""),
-                semantic_labels=json.dumps(case.get("semantic_labels", {}), ensure_ascii=False, indent=2),
+                semantic_labels=json.dumps(
+                    semantic_labels_for_prompt(case.get("semantic_labels", {})),
+                    ensure_ascii=False, indent=2,
+                ),
                 alarm_time=case.get("alarm_time", ""),
                 sop=case.get("sop", ""),
                 root_cause_candidates=json.dumps(case.get("root_cause_candidates", []), ensure_ascii=False, indent=2),

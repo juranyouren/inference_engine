@@ -1,0 +1,268 @@
+"""合作型 Orchestrator、三位专家、意见池与 Aggregator。"""
+
+from __future__ import annotations
+
+from .agent_runner import (
+    AgentInference, complete_ranking, final_text, response_json,
+)
+from .cooperation_telemetry import normalize_telemetry, select_telemetry, semantic_labels_template
+from .result_parser import candidate_categories
+
+
+SPECIALISTS = {
+    "log": "log_data",
+    "time_series": "time_series_data",
+    "metadata": "metadata",
+}
+INCIDENT_DESCRIPTIONS = {
+    "BGP邻接状态改变": "BGP 对等会话的邻接状态发生变化，需区分链路、接口、对端设备和协议异常。",
+    "接口状态DOWN": "网络设备接口进入 Down 状态，需区分主动关闭、接口故障及链路闪断。",
+    "网络设备掉线": "网络设备出现不可达或探测丢包异常，需核查设备、关联服务器和重启或变更线索。",
+    "入方向带宽利用率过高": "接口入方向带宽利用率触发告警，需核查流量偏高的幅度、持续时间及后续恢复情况。",
+}
+ORCHESTRATOR_PROMPT = (
+    "你是 Orchestrator。根据 incident_type、incident_type_description 和全部候选根因的名称及简要描述，"
+    "从 semantic_labels_template 的遥测全集中选择能区分这些候选的证据字段。"
+    "为 log、time_series、metadata 各生成一位面向当前告警的专家。只返回 JSON 对象，"
+    '三个键分别为 log、time_series、metadata，每个值形如 '
+    '{"persona":"角色及诊断职责","focus":[{"key":"模板中的原始路径","desc":"具体检查什么、如何区分候选"}]}。'
+    "focus 只能使用本类别的模板 key，同一 key 至多一次。优先选择有数据的最细字段。"
+    "key 中的 /* 可匹配数组各项，例如 /anomaly_kpi/traffic_in/abnormal_timing_segments/*/value。"
+    "需要时间戳与样本值相互印证时，同时选择相应字段。"
+    "available 为 false 的关键字段可用于指出证据缺口。该类没有相关线索时 focus 可为空。"
+)
+SPECIALIST_PROMPT = (
+    "你是 specialist.persona 指定的专家。按 specialist.focus 核对所选遥测的原始值，"
+    "区分已观测证据和缺失数据。"
+)
+OPINION_PROMPT = (
+    '能形成意见时，只输出 JSON 对象 {"reasoning_chain":["证据 → 诊断判断"],"root_cause":"根因名称"}。'
+    "简述可核查的证据和诊断依据，并标注缺失证据。候选列表非空时从中选择根因。"
+    "有可核查证据但无法确定候选根因时，保留依据并将 root_cause 填为 null。"
+    "没有可补充证据时，只输出 NO COMMENT。"
+)
+REVIEW_PROMPT = (
+    "审阅同一轮收到的各专家最新意见及你的原始证据。有新增证据或修正时提交一份完整的更新意见，"
+    "其中保留仍然有效的依据。更新意见会替换你此前的意见。"
+    "无需补充时只输出 NO COMMENT。"
+)
+AGGREGATOR_PROMPT = (
+    '你是 Aggregator。综合各专家最新意见中的证据与分歧，输出 JSON 对象 '
+    '{"ranking":["最可能根因","其他根因"],"reason":"主要依据和不确定性"}。'
+    "skipped_specialists 列出缺少可用遥测或未选择相关线索的专家，将其视为证据缺口。"
+    "abstained_specialists 列出未形成可用意见的专家。"
+    "意见中 root_cause 为 null 表示该专家只提供证据，请结合这些证据判断候选根因。"
+    "若提供候选列表，按可能性排列全部候选，每项恰好一次。"
+)
+
+
+def _candidate_details(candidates):
+    descriptions = {}
+    for item in candidates or []:
+        if not isinstance(item, dict):
+            continue
+        names = candidate_categories([item])
+        if not names or names[0] in descriptions:
+            continue
+        for field in ("description", "desc", "reason"):
+            value = item.get(field)
+            if isinstance(value, str) and value.strip():
+                descriptions[names[0]] = value.strip()
+                break
+    return [
+        {"category": name, "description": descriptions.get(name, "")}
+        for name in candidate_categories(candidates)
+    ]
+
+
+class CooperationInference(AgentInference):
+    """专家的初评与复评共享意见池，结束后由 Aggregator 汇总。"""
+
+    mode = "cooperation"
+
+    def __init__(
+        self, engine, *, invoke_limit=10, max_rounds=None, **kwargs,
+    ):
+        if type(invoke_limit) is not int or invoke_limit < 5:
+            raise ValueError("invoke_limit 必须为至少 5 的整数")
+        if max_rounds is not None:
+            if type(max_rounds) is not int or max_rounds <= 0:
+                raise ValueError("max_rounds 必须为正整数")
+            invoke_limit = min(invoke_limit, 5 + 3 * max_rounds)
+        self.invoke_limit = invoke_limit
+        super().__init__(engine, **kwargs)
+
+    @staticmethod
+    def _personas(response, template):
+        personas = response_json(response)
+        if not isinstance(personas, dict) or not personas.keys() <= SPECIALISTS.keys():
+            raise ValueError("Orchestrator 必须为 log、time_series、metadata 各生成一个 persona")
+        for role in SPECIALISTS:
+            specialist = personas.get(role)
+            if specialist is None and not any(item["available"] for item in template[role]):
+                personas[role] = {"persona": f"{role} 专家暂无可用遥测", "focus": []}
+                continue
+            if not isinstance(specialist, dict) or specialist.keys() != {"persona", "focus"}:
+                raise ValueError(f"{role} 专家必须包含 persona 和 focus")
+            persona, focus = specialist["persona"], specialist["focus"]
+            if not isinstance(persona, str) or not persona.strip() or not isinstance(focus, list):
+                raise ValueError(f"{role} 专家需要角色说明和关注点列表")
+            allowed = {item["key"] for item in template[role]}
+            selected = set()
+            for detail in focus:
+                if not isinstance(detail, dict) or detail.keys() != {"key", "desc"}:
+                    raise ValueError(f"{role} 的关注点必须包含 key 和 desc")
+                key, desc = detail["key"], detail["desc"]
+                if not isinstance(key, str) or key not in allowed or key in selected:
+                    raise ValueError(f"{role} 的关注点必须使用该类别中互不重复的模板 key")
+                if not isinstance(desc, str) or not desc.strip():
+                    raise ValueError(f"{role} 的关注点必须有具体检查说明")
+                selected.add(key)
+        return personas
+
+    @staticmethod
+    def _opinion(response, candidates, role, round_index):
+        text = final_text(response)
+        if not text:
+            raise ValueError(f"{role} 专家未返回最终回答")
+        if text == "NO COMMENT":
+            return None
+        opinion = response_json(response)
+        if not isinstance(opinion, dict):
+            raise ValueError(f"{role} 专家的意见必须为 JSON 对象")
+        chain = opinion.get("reasoning_chain")
+        cause = opinion.get("root_cause")
+        if "root_cause" in opinion and cause is None and not chain:
+            return None
+        if not isinstance(chain, list) or not chain or any(
+            not isinstance(item, str) or not item.strip() for item in chain
+        ):
+            raise ValueError(f"{role} 专家的 reasoning_chain 必须为非空字符串列表")
+        cause = cause.strip() if isinstance(cause, str) else None
+        if not cause or (candidates and cause not in candidates):
+            cause = None
+        return {"agent": role, "round": round_index, "reasoning_chain": chain, "root_cause": cause}
+
+    def _infer_case(self, case, output_dir, result):
+        labels = normalize_telemetry(case.semantic_labels)
+        candidate_details = _candidate_details(case.root_cause_candidates)
+        candidates = [item["category"] for item in candidate_details]
+        incident_description = case.incident_type_description or INCIDENT_DESCRIPTIONS.get(
+            case.alarm_type, f"{case.alarm_type} 告警，结合候选根因及其描述确定诊断范围。",
+        )
+        context = {
+            "alarm_type": case.alarm_type, "alarm_time": case.alarm_time,
+            "incident_type_description": incident_description,
+            "root_cause_candidates": candidates,
+        }
+        result.update(
+            opinion_pool=[], invoke_limit=self.invoke_limit, agent_invocations=0,
+            round_count=0, early_stopped=False, rounds=[],
+            skipped_specialists={}, specialist_issues=[],
+        )
+
+        def invoke(requests, *, allow_empty_responses=False):
+            result["agent_invocations"] += len(requests)
+            try:
+                return self.generator.generate(
+                    requests, output_dir, allow_empty_responses=allow_empty_responses,
+                )
+            except (ValueError, RuntimeError) as exc:
+                stages = ", ".join(stage for stage, _prompt, _payload in requests)
+                raise RuntimeError(f"合作型调用失败 [{stages}]: {exc}") from exc
+
+        template = semantic_labels_template(labels)
+        plan, = invoke([("orchestrator", ORCHESTRATOR_PROMPT, {
+            "incident_type": case.alarm_type,
+            "incident_type_description": incident_description,
+            "root_cause_candidates": candidate_details,
+            "semantic_labels_template": template,
+        })])
+        personas = self._personas(plan, template)
+        result["personas"] = personas
+        specialist_data = {}
+        for role, group in SPECIALISTS.items():
+            available = {item["key"] for item in template[role] if item["available"]}
+            focus = personas[role]["focus"]
+            missing = [detail["key"] for detail in focus if detail["key"] not in available]
+            if len(missing) == len(focus):
+                result["skipped_specialists"][role] = (
+                    "所选遥测没有可用数据" if focus else "未选择相关遥测"
+                )
+                continue
+            specialist_data[role] = {
+                **context, "specialist": personas[role], "missing_focus_keys": missing,
+                group: select_telemetry(labels, focus),
+            }
+
+        roles = list(specialist_data)
+        latest = {}
+
+        def collect_opinions(answers, active, round_index):
+            commented, no_comment = [], []
+            for role, answer in zip(active, answers):
+                try:
+                    opinion = self._opinion(answer, candidates, role, round_index)
+                except ValueError as exc:
+                    result["specialist_issues"].append({"agent": role, "round": round_index, "error": str(exc)})
+                    opinion = None
+                if opinion is None:
+                    no_comment.append(role)
+                else:
+                    if opinion["root_cause"] is None:
+                        result["specialist_issues"].append({
+                            "agent": role, "round": round_index,
+                            "error": "专家未给出可匹配的根因，已保留证据链",
+                        })
+                    latest[role] = opinion
+                    commented.append(role)
+            result["opinion_pool"] = [latest[role] for role in roles if role in latest]
+            result["rounds"].append({"round": round_index, "commented": commented, "no_comment": no_comment})
+            result["round_count"] = round_index + 1
+            return not commented
+
+        if roles:
+            initial = invoke([
+                (f"round0/{role}", SPECIALIST_PROMPT + OPINION_PROMPT, specialist_data[role])
+                for role in roles
+            ], allow_empty_responses=True)
+            collect_opinions(initial, roles, 0)
+        if not latest:
+            result["stop_reason"] = "insufficient_evidence"
+            raise ValueError("没有专家能够根据可用遥测形成根因意见")
+
+        while result["agent_invocations"] < self.invoke_limit - 1:
+            remaining = self.invoke_limit - result["agent_invocations"] - 1
+            active = roles[:remaining]
+            round_index = result["round_count"]
+            snapshot = result["opinion_pool"]
+            answers = invoke([
+                (
+                    f"round{round_index}/{role}",
+                    SPECIALIST_PROMPT + REVIEW_PROMPT + OPINION_PROMPT,
+                    {**specialist_data[role], "opinion_pool": snapshot},
+                )
+                for role in active
+            ], allow_empty_responses=True)
+            if collect_opinions(answers, active, round_index) and len(active) == len(roles):
+                result["early_stopped"] = True
+                break
+
+        result["stop_reason"] = "all_no_comment" if result["early_stopped"] else "invoke_limit"
+        answer, = invoke([
+            ("aggregator", AGGREGATOR_PROMPT, {
+                **context, "opinion_pool": result["opinion_pool"],
+                "skipped_specialists": result["skipped_specialists"],
+                "abstained_specialists": [role for role in roles if role not in latest],
+            }),
+        ])
+        result["final_result"] = answer
+        conclusion = response_json(answer)
+        if isinstance(conclusion, dict):
+            ranking = conclusion.get("ranking")
+            reason = conclusion.get("reason")
+        else:
+            ranking, reason = conclusion, None
+        ranking = complete_ranking(ranking, candidates, result)
+        result["conclusion"] = {"ranking": ranking, "reason": reason if isinstance(reason, str) else ""}
+        return ranking
