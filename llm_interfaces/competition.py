@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .agent_runner import AgentInference, case_evidence, response_json, validate_ranking
+from .agent_runner import AgentInference, case_evidence, complete_ranking, response_json
 from .competition_templates import load_competition_template
 from .result_parser import candidate_categories
 
@@ -12,18 +12,19 @@ VERIFIER_PROMPT = (
     "节点检查状态、证据引用和根因分支置信度，独立复核每个根因。"
     "把置信度作为参考，结合矛盾和缺失证据判断全部候选的相对可能性。"
     "候选 Agent 未报告的节点标为未知，请结合原始证据自行复核。"
+    "根因分支置信度为 null 表示候选 Agent 未给出有效评分。"
     "只输出候选根因名称的 JSON 数组，按可能性从高到低排列，全部候选恰好出现一次。"
 )
 
 
-def _validate_judgment(judgment, template, name, *, check_node=False):
+def _validate_node(judgment, template, name):
     if not isinstance(judgment, dict) or judgment.keys() != template.keys():
         raise ValueError(f"Agent 必须完整填写 {name} 对应的模板")
     outcome = judgment.get("condition_met")
-    if check_node and outcome is not None and type(outcome) is not bool:
+    if outcome is not None and type(outcome) is not bool:
         raise ValueError(f"{name} 的 condition_met 必须为 true、false 或 null")
     confidence = judgment["confidence"]
-    if check_node and outcome is None:
+    if outcome is None:
         valid_confidence = confidence is None
     else:
         valid_confidence = type(confidence) in (int, float) and 0 <= confidence <= 1
@@ -33,10 +34,30 @@ def _validate_judgment(judgment, template, name, *, check_node=False):
         raise ValueError(f"{name} 缺少判断依据")
 
 
-def _validate_diagnosis(response, prompt, templates):
-    diagnosis = response_json(response)
-    if not isinstance(diagnosis, dict) or not diagnosis.keys() <= {"decisions", "conclusion"}:
-        raise ValueError("竞争型 Agent 必须返回 decisions 和 conclusion 对象")
+def _normalize_conclusion(conclusion):
+    if not isinstance(conclusion, dict):
+        conclusion = {}
+    confidence = conclusion.get("confidence")
+    if isinstance(confidence, str):
+        try:
+            confidence = float(confidence)
+        except ValueError:
+            confidence = None
+    reason = conclusion.get("reason")
+    reason = reason.strip() if isinstance(reason, str) else ""
+    if type(confidence) not in (int, float) or not 0 <= confidence <= 1:
+        confidence = None
+        reason = "候选 Agent 未报告有效的分支置信度，等待 Verifier 复核。" + reason
+    return {"confidence": confidence, "reason": reason or "候选 Agent 未报告结论依据。"}
+
+
+def _normalize_diagnosis(response, prompt, templates):
+    try:
+        diagnosis = response_json(response)
+    except ValueError:
+        diagnosis = {}
+    if not isinstance(diagnosis, dict):
+        diagnosis = {}
     reported = diagnosis.get("decisions")
     if not isinstance(reported, dict):
         reported = {}
@@ -48,7 +69,7 @@ def _validate_diagnosis(response, prompt, templates):
             decisions[node_id] = {**result_template, "reason": "候选 Agent 未报告该节点，等待 Verifier 复核。"}
             continue
         try:
-            _validate_judgment(node, result_template, node_id, check_node=True)
+            _validate_node(node, result_template, node_id)
             clues = node["diagnostic_clues"]
             if not isinstance(clues, list) or any(
                 not isinstance(item, dict) or item.keys() != {"path", "value"}
@@ -60,10 +81,8 @@ def _validate_diagnosis(response, prompt, templates):
             decisions[node_id] = {**result_template, "reason": f"节点报告无效，等待 Verifier 复核。{exc}"}
         else:
             decisions[node_id] = node
-    conclusion = diagnosis.get("conclusion")
-    _validate_judgment(conclusion, prompt["conclusion_template"], "conclusion")
     return {"root_cause": prompt["root_cause"], "paths": prompt["paths"],
-            "decisions": decisions, "conclusion": conclusion}
+            "decisions": decisions, "conclusion": _normalize_conclusion(diagnosis.get("conclusion"))}
 
 
 class CompetitionInference(AgentInference):
@@ -96,11 +115,11 @@ class CompetitionInference(AgentInference):
             requests.append((f"reasoners/candidate_{index:02d}", entry["prompt"], payload))
             jobs.append((entry, nodes))
 
-        answers = self.generator.generate(requests, output_dir)
+        answers = self.generator.generate(requests, output_dir, allow_empty_responses=True)
         diagnoses = []
         result["diagnoses"] = diagnoses
         for answer, (entry, nodes) in zip(answers, jobs):
-            diagnoses.append(_validate_diagnosis(answer, entry, nodes))
+            diagnoses.append(_normalize_diagnosis(answer, entry, nodes))
         used_nodes = dict.fromkeys(node_id for _entry, nodes in jobs for node_id in nodes)
         verifier_payload = {
             "case": evidence,
@@ -112,4 +131,7 @@ class CompetitionInference(AgentInference):
         }
         answer, = self.generator.generate([("verifier", VERIFIER_PROMPT, verifier_payload)], output_dir)
         result["final_result"] = answer
-        return validate_ranking(response_json(answer), candidates)
+        ranking = response_json(answer)
+        if isinstance(ranking, dict):
+            ranking = ranking.get("ranking")
+        return complete_ranking(ranking, candidates, result)

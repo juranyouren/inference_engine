@@ -6,7 +6,7 @@
 
 ## 1. Orchestrator 为当前告警设计三位专家
 
-Orchestrator 收到告警类别及其描述、全部候选根因及其简要描述，以及语义标签模板。告警描述可通过 label 或 `semantic_labels` 的 `incident_type_description` 或 `alarm_type_description` 提供。基础模板取自四份样例的 `semantic_labels` 字段并集，路径支持递归到对象和数组内的叶子字段。程序再补上当前样本中的扩展字段，并用 `available` 标记字段是否有数据。以下省略了模板中的其他字段。[语义标签模板](semantic_labels_template.json)
+Orchestrator 收到告警类别及其描述、全部候选根因及其简要描述，以及按当前样本 `semantic_labels` 生成的字段目录。告警描述可通过 label 或 `semantic_labels` 的 `incident_type_description` 或 `alarm_type_description` 提供。路径支持递归到对象和数组内的叶子字段。`available` 标记字段是否有数据。以下省略了目录中的其他字段。
 
 ```json
 {

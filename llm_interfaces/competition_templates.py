@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 from functools import lru_cache
-from pathlib import Path
 
 from .sop_preprocess import compile_sop
 
@@ -67,13 +66,6 @@ def _procedure_graph(alarm_type, sop):
     }
 
 
-def _signature(template):
-    return (
-        {key: node["condition"] for key, node in template["decision_templates"].items()},
-        {node["root_cause"]: node["paths"] for node in template["root_cause_prompts"].values()},
-    )
-
-
 @lru_cache(maxsize=128)
 def load_competition_template(alarm_type, sop):
     if sop.startswith("{"):
@@ -83,10 +75,4 @@ def load_competition_template(alarm_type, sop):
         graph["alarm_type"] = alarm_type
         return compile_sop(graph)
 
-    compiled = compile_sop(_procedure_graph(alarm_type, sop))
-    template_dir = Path(__file__).with_name("sop_templates")
-    for path in sorted(template_dir.glob("*.templates.json")):
-        template = json.loads(path.read_text(encoding="utf-8"))
-        if template["alarm_type"] == alarm_type and _signature(template) == _signature(compiled):
-            return template
-    return compiled
+    return compile_sop(_procedure_graph(alarm_type, sop))

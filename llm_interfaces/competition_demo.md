@@ -2,7 +2,7 @@
 
 `case + SOP 模板 → 各候选根因独立诊断 → Verifier 复核排序`
 
-下面使用仓库内的[网络设备掉线模板](sop_templates/network_device_offline.templates.json)和简化的示意数据。示例输出用于说明数据如何流动。
+下面使用仓库内的网络设备掉线预处理示例和简化数据演示流程。实际评测会从当前样本的 SOP 编译路径。[预处理示例](sop_templates/network_device_offline.templates.json)
 
 ## 1. 按候选根因分发诊断任务
 
@@ -68,6 +68,8 @@
 Verifier 收到完整原始语义标签、决策条件、五份已填诊断以及各自的路径。它用原始证据独立复核判断。在这个示例中，评估根因 3 的 Agent 引用告警前 10 秒的本端 `reboot` 记录，Verifier 据此将变更重启排在首位。
 
 候选 Agent 漏填某个决策节点时，程序将该节点的检查状态和置信度标为 `null`，并注明漏报。Verifier 仍会收到该候选的路径、已报告的证据和分支置信度。
+
+分支结论缺失或置信度无效时，程序用 `null` 标记该评分，并保留可用的节点报告。Verifier 漏排的候选按候选列表顺序追加到末尾，补齐项记在 `ranking_appended`。
 
 ```json
 [

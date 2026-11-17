@@ -3,7 +3,7 @@
 本目录是独立的 Python 包，项目内依赖均位于本目录。它提供两个入口类：
 
 - `CompetitionInference` 为每个候选根因独立填写 SOP 路径，Verifier 用原始证据复核并排序。[竞争型演示](competition_demo.md)
-- `CooperationInference` 由 Orchestrator 根据告警类型、候选根因及[语义标签模板](semantic_labels_template.json)生成三位专家的 persona。专家共享各自的最新意见，Aggregator 汇总。[合作型演示](cooperation_demo.md)
+- `CooperationInference` 由 Orchestrator 根据告警类型、候选根因及当前样本的语义标签目录生成三位专家的 persona。专家共享各自的最新意见，Aggregator 汇总。[合作型演示](cooperation_demo.md)
 
 模型由 `LLMEngine.get_instance()` 第一次调用时加载。Competition、Cooperation、
 Selector 和 Refiner 都可以接收同一个 engine 实例，整个 main 进程只加载一次模型。
@@ -106,18 +106,20 @@ python -m llm_interfaces.main \
 在仓库根目录运行以下命令，替换 `--label-root` 后的数据集路径即可做配对评测。
 
 ```bash
-python run_agent_evaluation.py --label-root /home/sbp/deployment/case_pool/AgentDigest_label --output-dir res/agent_evaluation
+python run_agent_evaluation.py --label-root /home/sbp/deploy/case_pool/anomalydetect_label_0 --import-top-level-sop --output-dir res/agent_evaluation
 ```
 
 数据集根目录中的类别会动态发现。`--mode` 可选 `both`、`competition` 或 `cooperation`。`both` 只选择有 SOP 的 case，对同一 case 分别运行两种模式。合作型使用隐藏 SOP 的副本。若数据集的 SOP 位于 JSON 顶层，可加 `--import-top-level-sop`，在本次评测的内存副本中导入。
 
 加 `--limit-per-mode 10` 时，每种模式只跑前 10 个符合条件的 case。先按类别名排序，再按类内样本索引读取。若同时设置 `--limit-per-category`，先应用每类上限，再筛选 SOP 和累计每模式的上限。并行入口也接受该参数，所有分片合计最多 10 个 case 每模式。
 
-结果目录包含 `metrics.json`、`metrics.csv` 和 `traces/`。指标包括 Top-1/3/5、MRR、耗时及失败数，模型推理失败的有标注样本按未命中计分。
+结果目录包含 `metrics.json`、`metrics.csv` 和 `traces/`。Verifier 或 Aggregator 漏报候选时，程序将漏报项按候选列表顺序追加到模型排名末尾，并记录在 `ranking_appended`。Top-1/3/5 和 MRR 按补齐后的排序计算。模型推理失败的有标注样本按未命中计分。
 
-多卡并行可运行 [run_agent_evaluation_parallel.sh](../run_agent_evaluation_parallel.sh)。脚本顶部有完整命令示例。卡号来自 `--ascend-devices`、`ASCEND_RT_VISIBLE_DEVICES` 或 `config`，每两张卡跑一个分片。分片结果和日志写入各自的 `shard_N/`，输出根目录的指标按全部 case 的排名重新计算。`elapsed_seconds` 是各分片评测耗时之和，`wall_elapsed_seconds` 是并行阶段实际经过的秒数，记录在汇总 JSON 中。
+多卡并行默认读取 `/home/sbp/deploy/case_pool/anomalydetect_label_0`，并导入 label 顶层 SOP。默认卡号为 `0,1,2,3,4,5,6,7`，每两张卡跑一个分片。可通过 `--ascend-devices` 或 `ASCEND_RT_VISIBLE_DEVICES` 指定卡号。分片结果和日志写入各自的 `shard_N/`，输出根目录的指标按全部 case 的排名重新计算。`elapsed_seconds` 是各分片评测耗时之和，`wall_elapsed_seconds` 是并行阶段实际经过的秒数，记录在汇总 JSON 中。[并行评测入口](../run_agent_evaluation_parallel.sh)
 
 ## 竞争型预处理审阅稿
+
+运行时按当前 label 的 SOP 编译决策路径。下方网络设备掉线文件是离线预处理的示例。
 
 [网络设备掉线 SOP](sop_templates/network_device_offline.sop.json)定义了入口、6 个决策节点、证据字段和 5 个根因。可编辑这份结构化 SOP，然后在仓库根目录重新生成模板。
 

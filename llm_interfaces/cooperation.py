@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .agent_runner import (
-    AgentInference, final_text, response_json, validate_ranking,
+    AgentInference, complete_ranking, final_text, response_json,
 )
 from .cooperation_telemetry import normalize_telemetry, select_telemetry, semantic_labels_template
 from .result_parser import candidate_categories
@@ -258,7 +258,11 @@ class CooperationInference(AgentInference):
         ])
         result["final_result"] = answer
         conclusion = response_json(answer)
-        if not isinstance(conclusion, dict) or not isinstance(conclusion.get("reason"), str):
-            raise ValueError("Aggregator 必须返回 ranking 和 reason")
-        result["conclusion"] = conclusion
-        return validate_ranking(conclusion.get("ranking"), candidates)
+        if isinstance(conclusion, dict):
+            ranking = conclusion.get("ranking")
+            reason = conclusion.get("reason")
+        else:
+            ranking, reason = conclusion, None
+        ranking = complete_ranking(ranking, candidates, result)
+        result["conclusion"] = {"ranking": ranking, "reason": reason if isinstance(reason, str) else ""}
+        return ranking

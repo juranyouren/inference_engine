@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 在仓库根目录运行，修改 --ascend-devices 和 --label-root 指定卡号与数据集路径。
-# bash run_agent_evaluation_parallel.sh --ascend-devices 0,1,2,3 --label-root /home/sbp/deployment/case_pool/AgentDigest_label --output-dir res/agent_evaluation_parallel
-# 卡号可通过 ASCEND_RT_VISIBLE_DEVICES 提供，默认取 config.ASCEND_RT_VISIBLE_DEVICES。
+# 在仓库根目录运行。默认读取 /home/sbp/deploy/case_pool/anomalydetect_label_0 的顶层 SOP。
+# bash run_agent_evaluation_parallel.sh --limit-per-mode 10 --output-dir res/agent_evaluation_parallel
+# 默认卡号为 0,1,2,3,4,5,6,7，可用 --ascend-devices 或 ASCEND_RT_VISIBLE_DEVICES 指定卡号。
 # 每两张卡运行一个分片，单出的卡空闲。每个分片的日志和结果在 shard_N 目录，汇总在输出根目录。
-# 支持原评测入口的参数。SOP 位于 JSON 顶层时可加 --import-top-level-sop。
+# 支持原评测入口的参数，可用 --label-root 指定其他数据集路径。
 # 每种模式只跑前 N 个符合条件的 case 时，加 --limit-per-mode N。各分片共享这个上限。
 # 如需指定 Python 解释器，可设置 RCA_PYTHON。
 
@@ -12,9 +12,9 @@ set -euo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$repo_dir"
 python_bin=${RCA_PYTHON:-python}
-devices=${ASCEND_RT_VISIBLE_DEVICES:-}
+devices=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 output_dir=res/agent_evaluation_parallel
-evaluation_args=()
+evaluation_args=(--label-root /home/sbp/deploy/case_pool/anomalydetect_label_0 --import-top-level-sop)
 
 fail() {
     printf '%s\n' "$1" >&2
@@ -55,9 +55,6 @@ while (($#)); do
     esac
 done
 
-if [[ -z "$devices" ]]; then
-    devices=$("$python_bin" -c 'import config; print(config.ASCEND_RT_VISIBLE_DEVICES)')
-fi
 devices=${devices%$'\r'}
 [[ "$devices" != *, ]] || fail '卡号列表末尾多了一个逗号'
 IFS=, read -r -a cards <<< "$devices"

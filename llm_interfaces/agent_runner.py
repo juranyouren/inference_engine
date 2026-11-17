@@ -29,16 +29,23 @@ def response_json(response):
         raise ValueError(f"Agent 返回的 JSON 无法解析: {exc.msg}") from exc
 
 
-def validate_ranking(ranking, candidates):
-    if not isinstance(ranking, list) or not ranking or any(
-        not isinstance(name, str) or not name.strip() for name in ranking
-    ):
-        raise ValueError("根因排序必须为非空字符串列表")
-    if len(set(ranking)) != len(ranking):
-        raise ValueError("根因排序包含重复项")
-    if candidates and set(ranking) != set(candidates):
-        raise ValueError("根因排序必须恰好包含所有候选根因")
-    return ranking
+def complete_ranking(ranking, candidates, result):
+    if not isinstance(ranking, list):
+        raise ValueError("根因排序必须为 JSON 数组")
+    ordered = {}
+    allowed = set(candidates)
+    for item in ranking:
+        name = item.get("category") if isinstance(item, dict) else item
+        if isinstance(name, str):
+            name = name.strip()
+            if name and (not allowed or name in allowed):
+                ordered.setdefault(name, None)
+    appended = [name for name in candidates if name not in ordered]
+    result["ranking_appended"] = appended
+    completed = list(ordered) + appended
+    if not completed:
+        raise ValueError("根因排序为空，且没有候选根因可补齐")
+    return completed
 
 
 def case_evidence(case):
@@ -102,7 +109,8 @@ class AgentInference:
             result.update(case_id=case.case_id, timestamp=case.alarm_time,
                           groundtruth=case.groundtruth, ttm=case.ttm)
             ranking = self._infer_case(case, output_dir, result)
-            result.update(prediction_fields(ranking, case.groundtruth, "structured_json"))
+            strategy = "structured_json_completed" if result.get("ranking_appended") else "structured_json"
+            result.update(prediction_fields(ranking, case.groundtruth, strategy))
             result["status"] = "success"
         except Exception as exc:
             result.update(status="failed", error=str(exc))

@@ -234,7 +234,7 @@ class LlmInterfaceTests(unittest.TestCase):
         ])
         template = planner["semantic_labels_template"]
         time_fields = {field["key"]: field for field in template["time_series"]}
-        self.assertFalse(time_fields["/anomaly_kpi/offline_loss_rate"]["available"])
+        self.assertNotIn("/anomaly_kpi/offline_loss_rate", time_fields)
         self.assertNotIn("/anomaly_kpi/temperature", time_fields)
         log_fields = {field["key"]: field for field in template["log"]}
         self.assertTrue(log_fields["/anomaly_logs/local_flash/port_down"]["available"])
@@ -516,20 +516,46 @@ class LlmInterfaceTests(unittest.TestCase):
             self.assertEqual(diagnosis["conclusion"]["confidence"], 0.2)
         self.assertIs(diagnoses[1]["decisions"]["step_02"]["condition_met"], False)
 
-    def test_competition_rejects_binary_root_cause_verdicts(self):
-        def binary_verdict(instruction, payload):
+    def test_competition_normalizes_invalid_candidate_conclusions(self):
+        def invalid_conclusion(instruction, payload):
             answer = default_answer(instruction, payload)
             if "decision_templates" in payload:
-                answer["conclusion"]["supported"] = False
+                if payload["root_cause"] == "链路故障":
+                    answer["conclusion"] = {"confidence": "unknown", "reason": "待核对", "supported": False}
+                    answer["decisions"]["step_01"].update(condition_met=True, confidence=0.9)
+                else:
+                    answer.pop("conclusion")
             return answer
 
-        engine = fake_engine(binary_verdict)
+        engine = fake_engine(invalid_conclusion)
         inference = CompetitionInference(engine, sampling_params_factory=fake_sampling_params)
         with tempfile.TemporaryDirectory() as root:
             row, = inference.infer_results([competition_label()], "场景", root)
-        self.assertEqual(row["status"], "failed")
-        self.assertIn("conclusion", row["error"])
-        self.assertEqual(len(engine.llm.requests), 2)
+        self.assertEqual(row["status"], "success")
+        first, second = engine.llm.requests[-1][1]["diagnoses"]
+        self.assertIs(first["decisions"]["step_01"]["condition_met"], True)
+        self.assertIsNone(first["conclusion"]["confidence"])
+        self.assertIn("待核对", first["conclusion"]["reason"])
+        self.assertNotIn("supported", first["conclusion"])
+        self.assertIsNone(second["conclusion"]["confidence"])
+
+    def test_incomplete_final_rankings_are_completed_in_candidate_order(self):
+        def partial_rank(instruction, payload):
+            if "diagnoses" in payload or instruction.startswith("你是 Aggregator"):
+                return {"ranking": ["配置错误", "配置错误", "未列出的根因"]}
+            return default_answer(instruction, payload)
+
+        for inference_class in (CompetitionInference, CooperationInference):
+            with self.subTest(mode=inference_class.mode), tempfile.TemporaryDirectory() as root:
+                inference = inference_class(fake_engine(partial_rank), sampling_params_factory=fake_sampling_params)
+                label = competition_label(("链路故障", "配置错误", "设备异常"))
+                if inference_class is CooperationInference:
+                    label["semantic_labels"].pop("sop")
+                row, = inference.infer_results([label], "场景", root)
+                self.assertEqual(row["status"], "success")
+                self.assertEqual(row["predicted_list_v1"], ["配置错误", "链路故障", "设备异常"])
+                self.assertEqual(row["ranking_appended"], ["链路故障", "设备异常"])
+                self.assertEqual(row["parse_strategy"], "structured_json_completed")
 
     def test_competition_writes_category_csv_using_list_index(self):
         categories = [f"根因{i}" for i in range(1, 7)]

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from functools import lru_cache
-from pathlib import Path
 
 
-@lru_cache(maxsize=1)
-def _base_template():
-    path = Path(__file__).with_name("semantic_labels_template.json")
-    return json.loads(path.read_text(encoding="utf-8"))
+TELEMETRY_GROUPS = {
+    "anomaly_logs": ("log", "异常日志、事件或计数"),
+    "anomaly_kpi": ("time_series", "KPI 观测和异常片段"),
+    "anomaly_netstreams": ("time_series", "网络流观测"),
+    "other_info": ("metadata", "设备、接口或命令回显信息"),
+}
 
 
 def _child_key(parent, field):
@@ -42,7 +42,7 @@ def has_telemetry(value):
 def normalize_telemetry(labels):
     """兼容以 JSON 字符串存储的遥测容器。"""
     normalized = dict(labels)
-    for field in ("anomaly_logs", "anomaly_kpi", "anomaly_netstreams", "other_info"):
+    for field in TELEMETRY_GROUPS:
         raw = normalized.get(field)
         if not isinstance(raw, str) or not raw.lstrip().startswith(("{", "[")):
             continue
@@ -55,24 +55,13 @@ def normalize_telemetry(labels):
 
 
 def semantic_labels_template(labels):
-    base = _base_template()
-    root_roles = {
-        "/" + key.split("/", 2)[1]: role
-        for role, fields in base.items()
-        for key in fields
-    }
-    catalog = {
-        role: {
-            key: {"key": key, "desc": desc, "available": False}
-            for key, desc in fields.items()
-        }
-        for role, fields in base.items()
-    }
+    catalog = {"log": {}, "time_series": {}, "metadata": {}}
     for field, value in labels.items():
-        fields = catalog[root_roles.get(_child_key("", field), "metadata")]
+        role, description = TELEMETRY_GROUPS.get(field, ("metadata", "本条样本提供的附加字段"))
+        fields = catalog[role]
         for key, raw_value in _fields({field: value}):
             entry = fields.setdefault(key, {
-                "key": key, "desc": "样本提供的扩展字段，结合字段名及上级遥测解释。", "available": False,
+                "key": key, "desc": description, "available": False,
             })
             entry["available"] |= has_telemetry(raw_value)
     return {role: list(fields.values()) for role, fields in catalog.items()}
