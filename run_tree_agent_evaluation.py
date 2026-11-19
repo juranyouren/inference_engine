@@ -180,6 +180,19 @@ def _training_selector_template(scenario, train_indices, catalog, import_top_lev
     }
 
 
+def legacy_tree_template(alarm_type, template_dir):
+    from utils.public_functions import load_alarm_template, semantic_labels_for_prompt
+
+    template = load_alarm_template(alarm_type, template_dir=str(template_dir))
+    raw = load_json(template["_template_path"])
+    if not isinstance(raw.get("semantic_labels"), dict) or not raw["semantic_labels"]:
+        raise ValueError(f"Tree 模板缺少 semantic_labels: {template['_template_path']}")
+    template["semantic_labels"] = semantic_labels_for_prompt(template["semantic_labels"])
+    template["root_cause_candidates"] = raw.get("root_cause_candidates") or []
+    template.pop("root_cause", None)
+    return template
+
+
 def _run_tree_stage(scenario, args, engine, selection_root, train_indices,
                     test_indices, reader, stage_dir, tag):
     from inference.tree import run_tree_once
@@ -187,15 +200,17 @@ def _run_tree_stage(scenario, args, engine, selection_root, train_indices,
     train_cases = reader.load_cases(train_indices)
     catalog = training_feature_catalog(train_cases)
     if args.selection_source == "selector":
-        template = _training_selector_template(
-            scenario, train_indices, catalog, args.import_top_level_sop,
-        )
+        legacy = args.tree_template_dir is not None
+        template = (legacy_tree_template(scenario["alarm_type"], args.tree_template_dir) if legacy
+                    else _training_selector_template(scenario, train_indices, catalog, args.import_top_level_sop))
         selection = generate_selection_by_selector(
             scenario, str(stage_dir), engine=engine, template=template, catalog=catalog,
+            training_prompt=not legacy,
         )
         save_json({
             "train_indices": train_indices, "test_indices": test_indices,
             "feature_catalog": catalog,
+            "template_path": template.get("_template_path"),
         }, str(stage_dir / "selector" / "source.json"))
     else:
         selection = bind_training_selection(load_selection(scenario, str(selection_root)), catalog)
@@ -314,6 +329,7 @@ def run_agents(
     if "cooperation" in methods:
         inferences["cooperation"] = CooperationInference(
             engine, batch_size=args.batch_size, invoke_limit=args.invoke_limit,
+            telemetry_template=load_json(str(args.cooperation_template)) if args.cooperation_template else None,
         )
 
     reports = {}
@@ -442,6 +458,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-path", type=Path,
                         help="selection-source=file 时的 selection.json 或包含各类配置的目录")
     parser.add_argument("--model-path", default=config.MODEL_PATH)
+    parser.add_argument("--cooperation-template", type=Path, help="合作型语义标签字段模板")
+    parser.add_argument("--tree-template-dir", type=Path, help="使用该目录中的旧类别模板和 Selector prompt")
     parser.add_argument("--ascend-devices")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-model-len", type=int, default=16384)

@@ -81,7 +81,7 @@ class CooperationInference(AgentInference):
     mode = "cooperation"
 
     def __init__(
-        self, engine, *, invoke_limit=10, max_rounds=None, **kwargs,
+        self, engine, *, invoke_limit=10, max_rounds=None, telemetry_template=None, **kwargs,
     ):
         if type(invoke_limit) is not int or invoke_limit < 5:
             raise ValueError("invoke_limit 必须为至少 5 的整数")
@@ -90,6 +90,7 @@ class CooperationInference(AgentInference):
                 raise ValueError("max_rounds 必须为正整数")
             invoke_limit = min(invoke_limit, 5 + 3 * max_rounds)
         self.invoke_limit = invoke_limit
+        self.telemetry_template = telemetry_template
         super().__init__(engine, **kwargs)
 
     @staticmethod
@@ -195,7 +196,7 @@ class CooperationInference(AgentInference):
             result["agent_invocations"] += len(requests)
             return request_stage(result, name, requests, final=final)
 
-        template = semantic_labels_template(labels)
+        template = semantic_labels_template(labels, self.telemetry_template)
         plan, = yield from invoke("orchestrator", [("orchestrator", ORCHESTRATOR_PROMPT, {
             "incident_type": case.alarm_type,
             "incident_type_description": incident_description,

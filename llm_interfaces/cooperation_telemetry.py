@@ -54,8 +54,12 @@ def normalize_telemetry(labels):
     return normalized
 
 
-def semantic_labels_template(labels):
-    catalog = {"log": {}, "time_series": {}, "metadata": {}}
+def semantic_labels_template(labels, base=None):
+    catalog = {
+        role: {key: {"key": key, "desc": desc, "available": False}
+               for key, desc in (base or {}).get(role, {}).items()}
+        for role in ("log", "time_series", "metadata")
+    }
     for field, value in labels.items():
         role, description = TELEMETRY_GROUPS.get(field, ("metadata", "本条样本提供的附加字段"))
         fields = catalog[role]

@@ -277,6 +277,7 @@ def generate_selection_by_selector(
     engine=None,
     template: Optional[Dict[str, Any]] = None,
     catalog=None,
+    training_prompt=True,
 ) -> Dict[str, Any]:
     LLMEngine, Selector, _Refiner = _lazy_import_selector_refiner()
 
@@ -289,7 +290,7 @@ def generate_selection_by_selector(
             max_model_len=16384,
         )
     selector = Selector(engine, "SELECTOR")
-    if catalog is not None:
+    if catalog is not None and training_prompt:
         from llm_inference.prompts import TRAINING_SELECTOR_PROMPT
         selector.prompt = TRAINING_SELECTOR_PROMPT
 
