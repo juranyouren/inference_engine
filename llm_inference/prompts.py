@@ -1000,6 +1000,20 @@ SOP：{sop}
 ```
 '''.strip()
 
+TRAINING_SELECTOR_PROMPT = r'''
+你是 RCA 决策树特征选择器。根据告警类型、SOP、显式候选和整个训练集的可提取字段，选择区分根因所需的日志计数与 KPI 统计。
+告警类型：{alarm_type}
+训练集字段目录：{semantic_labels}
+SOP：{sop}
+候选根因：{root_cause_candidates}
+log 可填 syslog_brief:<目录中的原始事件名>、legacy_log 中的字段，或 syslog_brief、syslog_message 整组。
+syslog_message_examples 仅是消息模板预览；选择 syslog_message 会使用整个训练集的消息模板分别计数。
+两组 syslog 都没有端侧标记。flash_count 可计算汇总闪断次数。接口状态等元数据由程序自动提取。
+kpi 键使用目录中的指标，每项选择 mix（全部异常段）或 alarming（告警最近段），可同时选两者；
+再选 max、min、mean、duration 中需要的统计。未指定的训练指标默认 mix、mean。
+只输出 JSON 对象，格式为 {{"log":["syslog_brief"],"kpi":{{"traffic_in":["alarming","max"]}}}}。
+'''.strip()
+
 REFINER_PROMPT = r'''
 你是 RCA 决策树特征选择优化器。根据当前 selection 和决策树推理 summary，调整特征选择以减少错误案例。
 

@@ -12,7 +12,7 @@
 
 --dataset-root 下每个直接子目录视为一个告警类别；也兼容直接包含 label 文件的单类别目录。
 每类按 label index 升序取前 50 条训练 Tree，紧接着的 150 条作为测试窗口。
-Tree 默认每次使用当前类别首个训练样本调用 Selector 重新生成 selection。
+Tree 默认根据当前类别整个训练集的可提取字段调用 Selector 重新生成 selection。
 生成结果及 Selector 输入输出保存到 output-dir/tree/<类别>/。
 Competition 处理测试窗口中有 semantic_labels.sop 的样本。SOP 在 JSON 顶层时，
 可传 --import-top-level-sop。Cooperation 使用同一测试窗口，并从模型输入中移除 SOP。
@@ -42,8 +42,10 @@ from inference.common import (
     save_json,
 )
 from inference.metrics import calculate_metrics
-from inference.selection import generate_selection_by_selector, load_selection
-from llm_interfaces.data_adapter import normalize_case, read_sop, with_top_level_sop, without_sop
+from inference.selection import (
+    bind_training_selection, generate_selection_by_selector, load_selection, training_feature_catalog,
+)
+from llm_interfaces.data_adapter import read_sop, with_top_level_sop, without_sop
 from llm_interfaces.io_utils import safe_category_name, save_batch_results
 
 
@@ -149,6 +151,33 @@ def _configure_devices(raw_devices: str | None) -> None:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(parts)
 
 
+def _training_selector_template(scenario, train_indices, catalog, import_top_level_sop):
+    sops = {}
+    candidates = {}
+    for index in train_indices:
+        label = _load_label(Path(scenario["label_map"][index]), index)
+        sop = read_sop(with_top_level_sop(label) if import_top_level_sop else label)
+        if sop:
+            sops[sop] = None
+        # 只使用原文件显式候选。Tree 训练用的 loader 可能用真实标签填补候选。
+        for item in label.get("root_cause_candidates") or []:
+            name = item.get("category") if isinstance(item, dict) else item
+            if isinstance(name, str) and name:
+                desc = item.get("description", "") if isinstance(item, dict) else ""
+                candidates[name] = candidates.get(name) or desc
+    fields = {
+        "kpi": catalog["kpi"], "legacy_log": catalog["legacy"],
+        "syslog_brief": catalog["syslog_brief"],
+        "syslog_message_template_count": len(catalog["syslog_message"]),
+        "syslog_message_examples": [key[:200] for key in catalog["syslog_message"][:8]],
+    }
+    return {
+        "alarm_type": scenario["alarm_type"], "semantic_labels": fields,
+        "sop": "\n\n".join(sops),
+        "root_cause_candidates": [{"category": key, "description": desc} for key, desc in candidates.items()],
+    }
+
+
 def run_tree(
     scenarios: List[Dict[str, Any]],
     args: argparse.Namespace,
@@ -179,38 +208,24 @@ def run_tree(
         test_indices = split_info[scenario["name"]]["test_indices"]
         reader = IndexedCaseReader(scenario["data_dir"], scenario["alarm_type"])
         train_cases = reader.load_cases(train_indices)
-        test_cases = reader.load_cases(test_indices)
         category_output = output_dir / safe_category_name(scenario["name"])
         started = time.perf_counter()
+        catalog = training_feature_catalog(train_cases)
         if args.selection_source == "selector":
-            first_index = train_indices[0]
-            label = _load_label(Path(scenario["label_map"][first_index]), first_index)
-            if args.import_top_level_sop:
-                label = with_top_level_sop(label)
-            case = normalize_case(
-                label,
-                input_index=first_index,
-                mode="competition" if read_sop(label) else "cooperation",
-                alarm_type=scenario["alarm_type"],
+            template = _training_selector_template(
+                scenario, train_indices, catalog, args.import_top_level_sop,
             )
-            template = {
-                "alarm_type": case.alarm_type,
-                "alarm_time": case.alarm_time,
-                "semantic_labels": case.semantic_labels,
-                "sop": case.sop,
-                "root_cause_candidates": case.root_cause_candidates,
-            }
             selection = generate_selection_by_selector(
-                scenario, str(category_output), engine=engine, template=template,
+                scenario, str(category_output), engine=engine, template=template, catalog=catalog,
             )
             save_json({
-                "label_file_path": label["_label_file_path"],
-                "input_index": first_index,
                 "train_indices": train_indices,
+                "feature_catalog": catalog,
             }, str(category_output / "selector" / "source.json"))
         else:
-            selection = load_selection(scenario, str(selection_root))
+            selection = bind_training_selection(load_selection(scenario, str(selection_root)), catalog)
         save_json(selection, str(category_output / "selection.json"))
+        test_cases = reader.load_cases(test_indices)
         result = run_tree_once(
             scenario=scenario,
             train_cases=train_cases,

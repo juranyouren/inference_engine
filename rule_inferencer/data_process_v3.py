@@ -1,11 +1,9 @@
-import os
-import json
 from typing import List, Dict, Any, Tuple
 import numpy as np
 from utils.public_functions import CaseDataLoader
-from sklearn.preprocessing import LabelEncoder
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.tree import export_text
+from rule_inferencer.feature_schema import (
+    EXCEPTION_EVENTS, FLASH_EVENTS, KPI_FIELDS, SYSLOG_GROUPS, kpi_segments, telemetry_dict,
+)
 import difflib
 
 
@@ -72,67 +70,19 @@ def extract_anomaly_logs_features(anomaly_logs: Dict[str, Any], selection) -> Di
     """
     features = {}
 
-    # 1. 直接展开的字典型键
-    ANOMALY_LOGS_SCHEMA = {
-        "local_exception": [
-            "Reason=Interface physical link is down",
-            "Reason=BGP direct connect-interface down",
-            "The local fault alarm has occurred",
-            "The physical status of the port changed to down",
-            "The remote fault alarm has occurred",
-            "Optical Module is invalid",
-            "The BFD session went Down",
-            "hwBfdSessDown(t)",
-            "CurrState=ESTABLISHED",
-            "CMDRECORD",
-            "REBOOT",
-        ],
-        "remote_exception": [
-            "Reason=Interface physical link is down",
-            "Reason=BGP direct connect-interface down",
-            "The local fault alarm has occurred",
-            "The physical status of the port changed to down",
-            "The remote fault alarm has occurred",
-            "Optical Module is invalid",
-            "The BFD session went Down",
-            "hwBfdSessDown(t)",
-            "CurrState=ESTABLISHED",
-            "CMDRECORD",
-            "REBOOT",
-        ],
-    }
-
-    ANOMALY_LOGS_SCHEMA_flash = {
-        "local_flash": [
-            "linkDown_active(l)",
-            "linkDown_clear(l)",
-            "hwPortDown(l)",
-            "hwPortUp(l)",
-            "hwBgpBackwardTransition_active(l)",
-            "hwBgpBackwardTransition_clear(l)",
-            "bgpBackwardTransition_active(l)",
-            "bgpBackwardTransition_clear(l)",
-            "PEER_STATE_CHG(l)",
-        ],
-        "remote_flash": [
-            "linkDown_active(l)",
-            "linkDown_clear(l)",
-            "hwPortDown(l)",
-            "hwPortUp(l)",
-            "hwBgpBackwardTransition_active(l)",
-            "hwBgpBackwardTransition_clear(l)",
-            "bgpBackwardTransition_active(l)",
-            "bgpBackwardTransition_clear(l)",
-            "PEER_STATE_CHG(l)",
-        ]
-    }
     selection = selection["log"]
+    for group in SYSLOG_GROUPS:
+        counts = telemetry_dict(anomaly_logs.get(group))
+        prefix = group + ":"
+        for field in selection:
+            if field.startswith(prefix):
+                count = counts.get(field[len(prefix):], 0)
+                features[f"anomaly_logs-{field}"] = int(count or 0)
 
-
-    for main_key, sub_keys in ANOMALY_LOGS_SCHEMA.items():
+    for main_key in ("local_exception", "remote_exception"):
         sub_dict = anomaly_logs.get(main_key, {})
 
-        for sub_key in sub_keys:
+        for sub_key in EXCEPTION_EVENTS:
             if sub_key not in selection:
                 continue
             feature_name = f"anomaly_logs-{main_key}-{sub_key}"
@@ -145,27 +95,29 @@ def extract_anomaly_logs_features(anomaly_logs: Dict[str, Any], selection) -> Di
 
     
 
-    if "template_occur_count" in selection:
-        # print("template_occur_count in selection")
-        for main_key, sub_keys in ANOMALY_LOGS_SCHEMA_flash.items():
-            sub_dict = anomaly_logs.get(main_key, {})
+    for main_key in ("local_flash", "remote_flash"):
+        sub_dict = anomaly_logs.get(main_key, {})
 
-            for sub_key in sub_keys:
-                if sub_key not in selection:
-                    continue
-                feature_name = f"anomaly_logs-{main_key}-{sub_key}"
+        for sub_key in FLASH_EVENTS:
+            if sub_key not in selection:
+                continue
+            feature_name = f"anomaly_logs-{main_key}-{sub_key}"
 
-                if isinstance(sub_dict, dict) and sub_key in sub_dict:
-                    features[feature_name] = int(sub_dict.get(sub_key, 0))
-                else:
-                    # 缺失字段 → 明确补 0
-                    features[feature_name] = 0
+            if isinstance(sub_dict, dict) and sub_key in sub_dict:
+                features[feature_name] = int(sub_dict.get(sub_key, 0))
+            else:
+                # 缺失字段 → 明确补 0
+                features[feature_name] = 0
     if "flash_count" in selection:
         local_flash_dict = anomaly_logs.get("local_flash", {})
         remote_flash_dict = anomaly_logs.get("remote_flash", {})
 
         features["anomaly_logs-local_flash_count"] = compute_flash_count(local_flash_dict)
         features["anomaly_logs-remote_flash_count"] = compute_flash_count(remote_flash_dict)
+        # 汇总日志没有端侧信息，单独保留全局计数。
+        features["anomaly_logs-syslog_brief_flash_count"] = compute_flash_count(
+            telemetry_dict(anomaly_logs.get("syslog_brief"))
+        )
 
     # 2. shutdown：是否存在内容 → 二值特征
     shutdown_keys = ["local_shutdown", "remote_shutdown"]
@@ -401,21 +353,11 @@ def extract_anomaly_kpi_features(
         else:
             features[name] = float(value)
 
-    kpi_keys = [
-        "traffic_in",
-        "traffic_out",
-        "drop_packet_rate",
-        "error_packet_rate",
-        "offline_loss_rate",
-        "cpu_utilization",
-        "memory_utilization",
-        "temperature",
-    ]
-
-    for kpi in kpi_keys:
-        sub_selection = selection["kpi"][kpi]
-        kpi_data = anomaly_kpi.get(kpi, {})
-        segments = kpi_data.get("abnormal_timing_segments", [])
+    for kpi in KPI_FIELDS:
+        sub_selection = selection["kpi"].get(kpi)
+        if not sub_selection:
+            continue
+        segments = kpi_segments(anomaly_kpi, kpi)
 
         # -------- mix --------
         mix_values: List[float] = []
@@ -507,7 +449,8 @@ def uniform_feature_subsample(
 # 传入selection
 def extract_all_features(
     semantic_labels: Dict[str, Any],
-    selection
+    selection,
+    alarm_time=None,
 ) -> Tuple[List[str], List[float], Dict[str, float]]:
     """
     组织所有特征提取模块，生成：
@@ -517,15 +460,16 @@ def extract_all_features(
     """
 
     features: Dict[str, float] = {}
-    alarm_time = semantic_labels.get("alarm_time", None)
+    if alarm_time in (None, ""):
+        alarm_time = semantic_labels.get("alarm_time")
+    if isinstance(alarm_time, str):
+        try:
+            alarm_time = float(alarm_time)
+        except ValueError:
+            alarm_time = None
 
     # ========= anomaly_logs =========
-    anomaly_logs = semantic_labels.get("anomaly_logs", {})
-    if isinstance(anomaly_logs, str):
-        try:
-            anomaly_logs = json.loads(anomaly_logs)
-        except Exception:
-            raise TypeError(f"anomaly_logs 应为 dict，但当前为 str: {anomaly_logs}")
+    anomaly_logs = telemetry_dict(semantic_labels.get("anomaly_logs"))
     features.update(
         extract_anomaly_logs_features(anomaly_logs, selection)
     )
@@ -537,16 +481,14 @@ def extract_all_features(
     )
 
     # ========= anomaly_kpi =========
-    anomaly_kpi = semantic_labels.get("anomaly_kpi", {})
-    if anomaly_kpi == "" or anomaly_kpi is None or not isinstance(anomaly_kpi, dict):
-        anomaly_kpi = {}
+    anomaly_kpi = telemetry_dict(semantic_labels.get("anomaly_kpi"))
 
     features.update(
         extract_anomaly_kpi_features(anomaly_kpi, alarm_time, selection)
     )
 
     # ========= other_info（需要 alarm_time） =========
-    other_info = semantic_labels.get("other_info", {})
+    other_info = telemetry_dict(semantic_labels.get("other_info"))
     
 
     features.update(
@@ -570,7 +512,7 @@ def extract_features_from_case(case_data, selection):
     从单个 case_data 中提取特征
     """
     semantic_labels = case_data["semantic_labels"]
-    feature_names, feature_values, _ = extract_all_features(semantic_labels, selection)
+    feature_names, feature_values, _ = extract_all_features(semantic_labels, selection, case_data.get("alarm_time"))
     return feature_names, feature_values
 
 def extract_features_from_case_range(
@@ -613,6 +555,8 @@ def extract_root_cause_labels(case_list):
     """
     从 case_data 列表中提取 root_cause.category，并编码成整数标签
     """
+    from sklearn.preprocessing import LabelEncoder
+
     raw_labels = []
 
     for case_data in case_list:

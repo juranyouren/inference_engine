@@ -8,23 +8,15 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import config
 from inference.common import ensure_dir, load_json, save_json
+from rule_inferencer.feature_schema import (
+    EXCEPTION_EVENTS, FLASH_EVENTS, KPI_FIELDS, SYSLOG_GROUPS, kpi_segments, telemetry_dict,
+)
 from utils.public_functions import load_alarm_template
 
 
 # ============================================================
 # 2. selection 规范化
 # ============================================================
-
-KPI_KEYS = [
-    "traffic_in",
-    "traffic_out",
-    "drop_packet_rate",
-    "error_packet_rate",
-    "offline_loss_rate",
-    "cpu_utilization",
-    "memory_utilization",
-    "temperature",
-]
 
 SEGMENT_CHOICES = {"mix", "alarming"}
 STAT_CHOICES = {"max", "min", "mean", "duration"}
@@ -79,20 +71,20 @@ def build_selection_from_selector(selector_result: Any) -> Dict[str, Any]:
         raw_log = []
 
     # 保留具体日志模板名；为空时使用默认聚合特征。
-    log = dedup_keep_order(raw_log) if raw_log else ["template_occur_count"]
+    log = dedup_keep_order(item for item in raw_log if isinstance(item, str)) or ["template_occur_count"]
 
     raw_kpi = raw.get("kpi", {})
     if not isinstance(raw_kpi, dict):
         raw_kpi = {}
 
     normalized_kpi = {}
-    for kpi in KPI_KEYS:
-        raw_values = raw_kpi.get(kpi, [])
+    for kpi, aliases in KPI_FIELDS.items():
+        raw_values = next((raw_kpi[key] for key in aliases if raw_kpi.get(key)), [])
         if not isinstance(raw_values, list):
             raw_values = [raw_values] if raw_values else []
 
         valid_values = dedup_keep_order(
-            [value for value in raw_values if value in KPI_CHOICES]
+            [value for value in raw_values if isinstance(value, str) and value in KPI_CHOICES]
         )
 
         final_values = list(valid_values)
@@ -108,6 +100,47 @@ def build_selection_from_selector(selector_result: Any) -> Dict[str, Any]:
     return {
         "log": log,
         "kpi": normalized_kpi,
+    }
+
+
+def training_feature_catalog(train_cases):
+    """只用训练样本建立可提取的日志列和 KPI 字典，按稳定顺序冻结。"""
+    fields = {group: set() for group in (*SYSLOG_GROUPS, "legacy", "kpi")}
+    for case in train_cases:
+        labels = case["semantic_labels"]
+        logs = telemetry_dict(labels.get("anomaly_logs"))
+        for group in SYSLOG_GROUPS:
+            fields[group].update(telemetry_dict(logs.get(group)))
+        for side in ("local", "remote"):
+            flash = telemetry_dict(logs.get(f"{side}_flash"))
+            if flash:
+                fields["legacy"].add("flash_count")
+                fields["legacy"].update(flash.keys() & FLASH_EVENTS)
+            exceptions = telemetry_dict(logs.get(f"{side}_exception"))
+            fields["legacy"].update(exceptions.keys() & EXCEPTION_EVENTS)
+        kpis = telemetry_dict(labels.get("anomaly_kpi"))
+        fields["kpi"].update(key for key in KPI_FIELDS if kpi_segments(kpis, key))
+    if fields["syslog_brief"].intersection(FLASH_EVENTS):
+        fields["legacy"].add("flash_count")
+    return {group: sorted(names) for group, names in fields.items()}
+
+
+def bind_training_selection(selection, catalog):
+    """将组名和具体事件展开为固定列，所有测试样本使用同一份配置。"""
+    options = {name: [name] for name in catalog["legacy"]}
+    all_logs = list(catalog["legacy"])
+    for group in SYSLOG_GROUPS:
+        columns = [f"{group}:{name}" for name in catalog[group]]
+        options[group] = columns
+        all_logs.extend(columns)
+        for name, column in zip(catalog[group], columns):
+            options[column] = [column]
+            options.setdefault(name, []).append(column)
+    options["template_occur_count"] = all_logs
+    selected = [col for key in selection["log"] for col in options.get(key, [])]
+    return {
+        "log": list(dict.fromkeys(selected or all_logs)),
+        "kpi": {key: selection["kpi"][key] for key in catalog["kpi"]},
     }
 
 # ============================================================
@@ -243,6 +276,7 @@ def generate_selection_by_selector(
     *,
     engine=None,
     template: Optional[Dict[str, Any]] = None,
+    catalog=None,
 ) -> Dict[str, Any]:
     LLMEngine, Selector, _Refiner = _lazy_import_selector_refiner()
 
@@ -255,6 +289,9 @@ def generate_selection_by_selector(
             max_model_len=16384,
         )
     selector = Selector(engine, "SELECTOR")
+    if catalog is not None:
+        from llm_inference.prompts import TRAINING_SELECTOR_PROMPT
+        selector.prompt = TRAINING_SELECTOR_PROMPT
 
     if template is None:
         template = load_alarm_template_compat(scenario["alarm_type"])
@@ -268,7 +305,15 @@ def generate_selection_by_selector(
         selector_ex_num,
     )
 
-    selection = build_selection_from_selector(selector_result)
+    try:
+        selection = build_selection_from_selector(selector_result)
+    except ValueError:
+        if catalog is None:
+            raise
+        print("[Selector] 无可解析的配置，按训练字段目录生成 selection")
+        selection = build_selection_from_selector({"log": ["template_occur_count"], "kpi": {}})
+    if catalog is not None:
+        selection = bind_training_selection(selection, catalog)
     save_json(
         selection,
         os.path.join(output_dir, "selection_selector.json"),

@@ -62,6 +62,7 @@ def extract_features_for_cases(
         names, values, features_dict = extract_all_features(
             case_data["semantic_labels"],
             selection,
+            case_data.get("alarm_time"),
         )
 
         if feature_names is None:
