@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .agent_runner import (
-    AgentInference, complete_ranking, final_text, response_json,
+    AgentInference, complete_ranking, final_text, request_stage, response_json,
 )
 from .cooperation_telemetry import normalize_telemetry, select_telemetry, semantic_labels_template
 from .result_parser import candidate_categories
@@ -173,7 +173,7 @@ class CooperationInference(AgentInference):
             cause = None
         return {"agent": role, "round": round_index, "reasoning_chain": chain, "root_cause": cause}
 
-    def _infer_case(self, case, output_dir, result):
+    def _case_stages(self, case, result):
         labels = normalize_telemetry(case.semantic_labels)
         candidate_details = _candidate_details(case.root_cause_candidates)
         candidates = [item["category"] for item in candidate_details]
@@ -191,23 +191,17 @@ class CooperationInference(AgentInference):
             skipped_specialists={}, specialist_issues=[], orchestrator_issues=[],
         )
 
-        def invoke(requests, *, allow_empty_responses=False):
+        def invoke(name, requests, *, final=False):
             result["agent_invocations"] += len(requests)
-            try:
-                return self.generator.generate(
-                    requests, output_dir, allow_empty_responses=allow_empty_responses,
-                )
-            except (ValueError, RuntimeError) as exc:
-                stages = ", ".join(stage for stage, _prompt, _payload in requests)
-                raise RuntimeError(f"合作型调用失败 [{stages}]: {exc}") from exc
+            return request_stage(result, name, requests, final=final)
 
         template = semantic_labels_template(labels)
-        plan, = invoke([("orchestrator", ORCHESTRATOR_PROMPT, {
+        plan, = yield from invoke("orchestrator", [("orchestrator", ORCHESTRATOR_PROMPT, {
             "incident_type": case.alarm_type,
             "incident_type_description": incident_description,
             "root_cause_candidates": candidate_details,
             "semantic_labels_template": template,
-        })], allow_empty_responses=True)
+        })])
         personas = self._personas(plan, template, result["orchestrator_issues"])
         result["personas"] = personas
         specialist_data = {}
@@ -252,10 +246,10 @@ class CooperationInference(AgentInference):
             return not commented
 
         if roles:
-            initial = invoke([
+            initial = yield from invoke("round0", [
                 (f"round0/{role}", SPECIALIST_PROMPT + OPINION_PROMPT, specialist_data[role])
                 for role in roles
-            ], allow_empty_responses=True)
+            ])
             if collect_opinions(initial, roles, 0):
                 result["early_stopped"] = True
 
@@ -267,26 +261,26 @@ class CooperationInference(AgentInference):
                 active = roles[:remaining]
                 round_index = result["round_count"]
                 snapshot = result["opinion_pool"]
-                answers = invoke([
+                answers = yield from invoke(f"round{round_index}", [
                     (
                         f"round{round_index}/{role}",
                         SPECIALIST_PROMPT + REVIEW_PROMPT + OPINION_PROMPT,
                         {**specialist_data[role], "opinion_pool": snapshot},
                     )
                     for role in active
-                ], allow_empty_responses=True)
+                ])
                 if collect_opinions(answers, active, round_index) and len(active) == len(roles):
                     result["early_stopped"] = True
                     break
 
             result["stop_reason"] = "all_no_comment" if result["early_stopped"] else "invoke_limit"
-        answer, = invoke([
+        answer, = yield from invoke("aggregator", [
             ("aggregator", AGGREGATOR_PROMPT, {
                 **context, "opinion_pool": result["opinion_pool"],
                 "skipped_specialists": result["skipped_specialists"],
                 "abstained_specialists": [role for role in roles if role not in latest],
             }),
-        ])
+        ], final=True)
         result["final_result"] = answer
         conclusion = response_json(answer)
         if isinstance(conclusion, dict):

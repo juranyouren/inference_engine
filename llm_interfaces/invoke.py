@@ -196,6 +196,7 @@ def vllm_invoke(
     prompt_output_paths: Optional[List[str | Path]] = None,
     require_complete_input: bool = False,
     allow_empty_responses: bool = False,
+    stage_name: Optional[str] = None,
 ) -> List[str]:
     if not inputs:
         return []
@@ -216,12 +217,14 @@ def vllm_invoke(
             save_text(prompt, path)
 
     responses: List[str] = []
-    for start in tqdm(range(0, len(fitted_inputs), batch_size)):
+    for start in tqdm(range(0, len(fitted_inputs), batch_size), disable=len(fitted_inputs) <= batch_size):
         batch_inputs = fitted_inputs[start:start + batch_size]
         chat_prompts = [
             [{"role": "user", "content": prompt}]
             for prompt in batch_inputs
         ]
+        if stage_name:
+            print(f"[llm.chat] stage={stage_name} prompts={len(chat_prompts)}", flush=True)
         outputs = llm.chat(
             chat_prompts,
             sampling_params,

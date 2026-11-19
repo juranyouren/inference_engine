@@ -67,12 +67,14 @@ class FakeLlm:
         )
         self.answer = answer
         self.requests = []
+        self.batch_sizes = []
 
     @staticmethod
     def get_tokenizer():
         return FakeTokenizer()
 
     def chat(self, prompts, sampling_params, use_tqdm=False):
+        self.batch_sizes.append(len(prompts))
         responses = []
         for chat in prompts:
             instruction, raw_payload = chat[0]["content"].split("\n\n输入 JSON\n", 1)
@@ -126,6 +128,86 @@ def cooperation_label():
 
 
 class LlmInterfaceTests(unittest.TestCase):
+    def test_competition_batches_paths_and_verifiers_across_cases(self):
+        def answer(instruction, payload):
+            marker = str(payload["case"]["alarm_time"])
+            if "diagnoses" in payload:
+                self.assertTrue(all(d["conclusion"]["reason"] == marker for d in payload["diagnoses"]))
+                return list(reversed(payload["root_cause_candidates"]))
+            diagnosis = default_answer(instruction, payload)
+            diagnosis["conclusion"]["reason"] = marker
+            return diagnosis
+
+        engine = fake_engine(answer)
+        agent = CompetitionInference(engine, batch_size=4, sampling_params_factory=fake_sampling_params)
+        indices = [9, 2, 17]
+        labels = [competition_label(tuple(f"{idx}_根因{j}" for j in range(count)))
+                  for idx, count in zip(indices, [2, 3, 2])]
+        for idx, label in zip(indices, labels):
+            label["alarm_time"] = idx
+        with tempfile.TemporaryDirectory() as root:
+            rows = agent.infer_results(labels, "场景", root, case_indices=indices)
+            self.assertEqual(engine.llm.batch_sizes, [4, 3, 3])
+            self.assertEqual([r["case_idx"] for r in rows], indices)
+            for row, idx, label in zip(rows, indices, labels):
+                self.assertEqual(row["status"], "success")
+                expected = [c["category"] for c in reversed(label["root_cause_candidates"])]
+                self.assertEqual(row["predicted_list_v1"], expected)
+                folder = Path(root) / "competition" / "场景" / f"case_{idx:06d}"
+                self.assertEqual(json.loads((folder / "verifier/raw_responses.txt").read_text("utf-8")), expected)
+                self.assertEqual(json.loads((folder / "result.json").read_text("utf-8")), row)
+
+    def test_cooperation_batches_only_active_cases_and_keeps_round_snapshots(self):
+        def answer(instruction, payload):
+            if "specialist" in payload:
+                marker = str(payload["alarm_time"])
+                if "opinion_pool" in payload:
+                    for opinion in payload["opinion_pool"]:
+                        self.assertEqual(opinion["reasoning_chain"], [marker])
+                    if marker == "1":
+                        return "NO COMMENT"
+                return {"reasoning_chain": [marker], "root_cause": payload["root_cause_candidates"][0]}
+            return default_answer(instruction, payload)
+
+        engine = fake_engine(answer)
+        agent = CooperationInference(engine, batch_size=8, sampling_params_factory=fake_sampling_params)
+        labels = [dict(cooperation_label(), alarm_time=i) for i in range(3)]
+        labels[0]["semantic_labels"] = {}
+        with tempfile.TemporaryDirectory() as root:
+            rows = agent.infer_results(labels, "场景", root)
+            self.assertEqual([r["status"] for r in rows], ["success"] * 3)
+            self.assertEqual(engine.llm.batch_sizes, [3, 6, 6, 2, 3])
+            self.assertEqual([r["agent_invocations"] for r in rows], [2, 8, 10])
+            self.assertEqual([r["stop_reason"] for r in rows],
+                             ["insufficient_evidence", "all_no_comment", "invoke_limit"])
+            for idx, row in enumerate(rows):
+                pool = row["opinion_pool"]
+                self.assertEqual(len(pool), 3 if idx else 0)
+                for opinion in pool:
+                    self.assertEqual(opinion["reasoning_chain"], [str(idx)])
+                folder = Path(row["output_dir"])
+                prompt = (folder / "aggregator/prompt.txt").read_text("utf-8")
+                self.assertEqual(json.loads(prompt.split("输入 JSON\n")[1])["opinion_pool"], pool)
+                self.assertEqual(len(list(folder.rglob("raw_responses.txt"))), row["agent_invocations"])
+            self.assertEqual([op["round"] for op in rows[2]["opinion_pool"]], [2, 2, 1])
+
+    def test_oversized_case_does_not_fail_healthy_requests_in_same_stage(self):
+        engine = fake_engine()
+        engine.llm.llm_engine.model_config.max_model_len = 8000
+        agent = CompetitionInference(engine, batch_size=8, sampling_params_factory=fake_sampling_params)
+        labels = [competition_label() for _ in range(3)]
+        labels[1]["semantic_labels"]["other_info"]["oversized"] = "x" * 12000
+        with tempfile.TemporaryDirectory() as root:
+            rows = agent.infer_results(labels, "场景", root)
+            self.assertEqual([r["status"] for r in rows], ["success", "failed", "success"])
+            self.assertIn("模型预算", rows[1]["error"])
+            self.assertEqual([issue["stage"] for issue in rows[1]["request_issues"]], [
+                "reasoners/candidate_01", "reasoners/candidate_02", "verifier",
+            ])
+            for row in (rows[0], rows[2]):
+                self.assertNotIn("request_issues", row)
+                self.assertEqual(len(list(Path(row["output_dir"]).rglob("raw_responses.txt"))), 3)
+
     def test_two_inference_classes_share_the_same_engine(self):
         engine = fake_engine()
         competition = CompetitionInference(engine, sampling_params_factory=fake_sampling_params)

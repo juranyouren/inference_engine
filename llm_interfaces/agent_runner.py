@@ -1,14 +1,15 @@
-"""共享的单 case 执行、结果校验和落盘。"""
+"""同类 case 分阶段批量执行，独立维护每个 case 的状态与结果。"""
 
 from __future__ import annotations
 
 import json
 import re
 import threading
+from itertools import islice
 from pathlib import Path
 
 from .data_adapter import groundtruth_category, normalize_case
-from .generator import RCAGenerator
+from .generator import AgentStage, RCAGenerator, RequestFailure
 from .io_utils import (
     case_output_dir, category_output_dir, csv_result_dict, save_batch_results,
     save_case_result, save_category_csvs,
@@ -56,6 +57,22 @@ def case_evidence(case):
     }
 
 
+def request_stage(result, name, requests, *, final=False):
+    """暂停当前 case，待同阶段请求批量完成后恢复。"""
+    responses = yield AgentStage(name, requests, final)
+    answers = []
+    for (path, _, _), response in zip(requests, responses):
+        if isinstance(response, RequestFailure):
+            result.setdefault("request_issues", []).append({"stage": path, "error": response.message})
+            if final:
+                raise RuntimeError(f"{path}: {response.message}")
+            response = ""
+        if final and not response:
+            raise RuntimeError(f"{path}: vLLM 返回了空响应")
+        answers.append(response)
+    return answers
+
+
 class AgentInference:
     def __init__(
         self, engine, *, batch_size=8, max_tokens=4096, prompt_safety_tokens=512,
@@ -85,12 +102,45 @@ class AgentInference:
         output_root = Path(output_dir) / self.mode
         category_dir = category_output_dir(output_root, alarm_type)
         with self._infer_lock:
-            results = [
-                self._run(label, index, alarm_type, case_output_dir(category_dir, index))
-                for index, label in zip(indices, input_list)
+            folders = [case_output_dir(category_dir, index) for index in indices]
+            workflows = [
+                self._run(label, index, alarm_type, folder)
+                for index, label, folder in zip(indices, input_list, folders)
             ]
+            results = self._run_stages(workflows, folders)
             save_batch_results(mode=self.mode, output_dir=output_root, results=results)
             save_category_csvs(output_root, results)
+        return results
+
+    def _run_stages(self, workflows, folders):
+        results = [None] * len(workflows)
+        pending = []
+        finals = []
+
+        def advance(pos, answers):
+            try:
+                stage = workflows[pos].send(answers)
+            except StopIteration as done:
+                results[pos] = done.value
+            else:
+                queue = finals if stage.final else pending
+                queue.append((pos, stage))
+
+        for pos in range(len(workflows)):
+            advance(pos, None)
+        while pending or finals:
+            # 先处理同一轮的活跃 case，已停止复议的 case 一起做最终排序。
+            if pending:
+                wave, pending = pending, []
+            else:
+                wave, finals = finals, []
+            requests = (
+                (folders[pos], request)
+                for pos, stage in wave for request in stage.requests
+            )
+            responses = self.generator.generate_stage(wave[0][1].name, requests)
+            for pos, stage in wave:
+                advance(pos, list(islice(responses, len(stage.requests))))
         return results
 
     def _run(self, label, index, alarm_type, output_dir):
@@ -108,7 +158,7 @@ class AgentInference:
             case = normalize_case(label, input_index=index, mode=self.mode, alarm_type=alarm_type)
             result.update(case_id=case.case_id, timestamp=case.alarm_time,
                           groundtruth=case.groundtruth, ttm=case.ttm)
-            ranking = self._infer_case(case, output_dir, result)
+            ranking = yield from self._case_stages(case, result)
             strategy = "structured_json_completed" if result.get("ranking_appended") else "structured_json"
             result.update(prediction_fields(ranking, case.groundtruth, strategy))
             result["status"] = "success"

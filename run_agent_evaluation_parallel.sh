@@ -4,6 +4,7 @@
 # 默认卡号为 0,1,2,3,4,5,6,7，可用 --ascend-devices 或 ASCEND_RT_VISIBLE_DEVICES 指定卡号。
 # 每两张卡运行一个分片，单出的卡空闲。每个分片的日志和结果在 shard_N 目录，汇总在输出根目录。
 # 支持原评测入口的参数，可用 --label-root 指定其他数据集路径。
+# --batch-size 8 表示每个分片内，同类告警同一阶段每次最多送入 8 条 prompt（默认值）。
 # 每种模式只跑前 N 个符合条件的 case 时，加 --limit-per-mode N。各分片共享这个上限。
 # 如需指定 Python 解释器，可设置 RCA_PYTHON。
 

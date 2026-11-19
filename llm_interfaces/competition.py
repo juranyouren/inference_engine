@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .agent_runner import AgentInference, case_evidence, complete_ranking, response_json
+from .agent_runner import AgentInference, case_evidence, complete_ranking, request_stage, response_json
 from .competition_templates import load_competition_template
 from .result_parser import candidate_categories
 
@@ -90,7 +90,7 @@ class CompetitionInference(AgentInference):
 
     mode = "competition"
 
-    def _infer_case(self, case, output_dir, result):
+    def _case_stages(self, case, result):
         template = load_competition_template(case.alarm_type, case.sop)
         all_decisions = template["decision_templates"]
         by_name = {entry["root_cause"]: entry for entry in template["root_cause_prompts"].values()}
@@ -115,7 +115,7 @@ class CompetitionInference(AgentInference):
             requests.append((f"reasoners/candidate_{index:02d}", entry["prompt"], payload))
             jobs.append((entry, nodes))
 
-        answers = self.generator.generate(requests, output_dir, allow_empty_responses=True)
+        answers = yield from request_stage(result, "reasoners", requests)
         diagnoses = []
         result["diagnoses"] = diagnoses
         for answer, (entry, nodes) in zip(answers, jobs):
@@ -129,7 +129,9 @@ class CompetitionInference(AgentInference):
             },
             "diagnoses": diagnoses,
         }
-        answer, = self.generator.generate([("verifier", VERIFIER_PROMPT, verifier_payload)], output_dir)
+        answer, = yield from request_stage(
+            result, "verifier", [("verifier", VERIFIER_PROMPT, verifier_payload)], final=True,
+        )
         result["final_result"] = answer
         ranking = response_json(answer)
         if isinstance(ranking, dict):

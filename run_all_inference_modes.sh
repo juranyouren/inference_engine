@@ -15,6 +15,7 @@
 # 读取已有配置可传 --selection-source file --selection-path /path/to/selections。
 # 兼容旧用法中的第三个 SELECTION_PATH 位置参数，仅在 --selection-source file 时使用。
 # 数据集 SOP 在 JSON 顶层时传 --import-top-level-sop。
+# 两种 Agent 按类别和阶段跨 case 组批。用 --batch-size N 设置每次提交的 prompt 上限，默认 8。
 
 set -euo pipefail
 

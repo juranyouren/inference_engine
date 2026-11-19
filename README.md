@@ -19,6 +19,8 @@ bash run_agent_evaluation_parallel.sh \
 
 并行入口默认使用 8 张卡，每两张卡运行一个分片。两个入口均支持 `--limit-per-mode N`。这套评测的 `both` 模式对同一批带 SOP 的样本运行两个 Agent，Cooperation 的输入会移除 SOP。详细参数见 [LLM 接口说明](llm_interfaces/README.md)。
 
+两套评测的 Agent 都在同一类别、同一分片内跨 case 组批。`--batch-size N` 控制每次送入模型的 prompt 数量上限，默认 8。竞争型先批量诊断候选路径，再批量运行 Verifier。合作型依次批量运行 Orchestrator、首轮专家和各轮复议，最后批量运行 Aggregator。意见池、早停和调用上限按 case 独立维护。日志中 `[llm.chat] stage=orchestrator prompts=8` 表示该次调用实际提交了 8 条 prompt。
+
 ## 每类前 50 条训练，接下来的 150 条测试
 
 ```bash
