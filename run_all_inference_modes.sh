@@ -8,9 +8,9 @@
 #     /home/sbp/deployment/case_pool/predict_result/fixed_split \
 #     --ascend-devices 6,7 --import-top-level-sop
 #
-# DATASET_ROOT 下每个类别子文件夹都会参与运行；每类前 50 个 label 训练 Tree，
+# DATASET_ROOT 下每个类别子文件夹都会参与运行；每类前 50 个 label 用于 Tree 初始训练，
 # 紧接着的 150 个 label 用作测试。Tree 在独立进程中先运行，随后两个 Agent 共用一次 LLM 初始化。
-# Tree 根据当前类别整个训练集的可提取字段重新生成 selection，结果写入 OUTPUT_DIR/tree/类别/。
+# Tree Selector 默认每轮用此前全部样本重新选特征和训练，各预测随后 50 条，结果写入 OUTPUT_DIR/tree/类别/round_XX/。
 # Tree 进程内各类别共用一次 Selector 模型初始化。
 # 读取已有配置可传 --selection-source file --selection-path /path/to/selections。
 # 兼容旧用法中的第三个 SELECTION_PATH 位置参数，仅在 --selection-source file 时使用。

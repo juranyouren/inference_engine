@@ -11,9 +11,9 @@
     python run_tree_agent_evaluation.py --dataset-root /path/to/labels --mode cooperation
 
 --dataset-root 下每个直接子目录视为一个告警类别；也兼容直接包含 label 文件的单类别目录。
-每类按 label index 升序取前 50 条训练 Tree，紧接着的 150 条作为测试窗口。
-Tree 默认根据当前类别整个训练集的可提取字段调用 Selector 重新生成 selection。
-生成结果及 Selector 输入输出保存到 output-dir/tree/<类别>/。
+每类按 label index 升序取前 50 条作为初始训练集，紧接着的 150 条作为测试窗口。
+Tree Selector 默认每 50 条推进一轮。用此前全部样本重新选特征、训练 Tree，预测下一块。
+每轮配置和预测保存到 output-dir/tree/<类别>/round_01 等目录。
 Competition 处理测试窗口中有 semantic_labels.sop 的样本。SOP 在 JSON 顶层时，
 可传 --import-top-level-sop。Cooperation 使用同一测试窗口，并从模型输入中移除 SOP。
 真实 root_cause 供 Tree 训练和结果评测使用。
@@ -38,6 +38,8 @@ from inference.common import (
     IndexedCaseReader,
     discover_label_index_map,
     ensure_dir,
+    iter_batches,
+    save_infer_outputs,
     load_json,
     save_json,
 )
@@ -178,14 +180,45 @@ def _training_selector_template(scenario, train_indices, catalog, import_top_lev
     }
 
 
+def _run_tree_stage(scenario, args, engine, selection_root, train_indices,
+                    test_indices, reader, stage_dir, tag):
+    from inference.tree import run_tree_once
+
+    train_cases = reader.load_cases(train_indices)
+    catalog = training_feature_catalog(train_cases)
+    if args.selection_source == "selector":
+        template = _training_selector_template(
+            scenario, train_indices, catalog, args.import_top_level_sop,
+        )
+        selection = generate_selection_by_selector(
+            scenario, str(stage_dir), engine=engine, template=template, catalog=catalog,
+        )
+        save_json({
+            "train_indices": train_indices, "test_indices": test_indices,
+            "feature_catalog": catalog,
+        }, str(stage_dir / "selector" / "source.json"))
+    else:
+        selection = bind_training_selection(load_selection(scenario, str(selection_root)), catalog)
+    save_json(selection, str(stage_dir / "selection.json"))
+    return run_tree_once(
+        scenario=scenario,
+        train_cases=train_cases,
+        infer_cases=reader.load_cases(test_indices),
+        train_indices=train_indices,
+        infer_indices=test_indices,
+        selection=selection,
+        output_dir=str(stage_dir),
+        output_format="all",
+        tag=tag,
+    )
+
+
 def run_tree(
     scenarios: List[Dict[str, Any]],
     args: argparse.Namespace,
     output_dir: Path,
     split_info: Dict[str, Dict[str, List[int]]],
 ) -> List[Dict[str, Any]]:
-    from inference.tree import run_tree_once
-
     engine = None
     if args.selection_source == "selector":
         _configure_devices(args.ascend_devices)
@@ -207,38 +240,35 @@ def run_tree(
         train_indices = split_info[scenario["name"]]["train_indices"]
         test_indices = split_info[scenario["name"]]["test_indices"]
         reader = IndexedCaseReader(scenario["data_dir"], scenario["alarm_type"])
-        train_cases = reader.load_cases(train_indices)
         category_output = output_dir / safe_category_name(scenario["name"])
         started = time.perf_counter()
-        catalog = training_feature_catalog(train_cases)
+        stage_size = args.tree_block_size if args.selection_source == "selector" else len(test_indices)
+        stages = []
+        results = []
+        history = list(train_indices)
+        for number, block in enumerate(iter_batches(test_indices, stage_size), start=1):
+            tag = f"round_{number:02d}" if args.selection_source == "selector" else "fixed_split"
+            stage_dir = category_output / tag if args.selection_source == "selector" else category_output
+            payload = _run_tree_stage(
+                scenario, args, engine, selection_root, history,
+                block, reader, stage_dir, tag,
+            )
+            results.extend(payload["results"])
+            stages.append({"round": number, "train_indices": history, "test_indices": block,
+                           "output_dir": str(stage_dir)})
+            history = history + block
         if args.selection_source == "selector":
-            template = _training_selector_template(
-                scenario, train_indices, catalog, args.import_top_level_sop,
-            )
-            selection = generate_selection_by_selector(
-                scenario, str(category_output), engine=engine, template=template, catalog=catalog,
-            )
-            save_json({
-                "train_indices": train_indices,
-                "feature_catalog": catalog,
-            }, str(category_output / "selector" / "source.json"))
-        else:
-            selection = bind_training_selection(load_selection(scenario, str(selection_root)), catalog)
-        save_json(selection, str(category_output / "selection.json"))
-        test_cases = reader.load_cases(test_indices)
-        result = run_tree_once(
-            scenario=scenario,
-            train_cases=train_cases,
-            infer_cases=test_cases,
-            train_indices=train_indices,
-            infer_indices=test_indices,
-            selection=selection,
-            output_dir=str(category_output),
-            output_format="all",
-            tag="fixed_split",
-        )
+            labeled = [r for r in results if r.get("groundtruth")]
+            correct = sum(r.get("rank") == 1 for r in labeled)
+            save_infer_outputs({
+                "meta": {"mode": "tree_infer", "scenario_name": scenario["name"],
+                         "initial_train_indices": train_indices, "infer_indices": test_indices, "rounds": stages},
+                "summary": {"processed_count": len(results), "processed_indices": [r["case_idx"] for r in results],
+                            "labeled_total": len(labeled), "correct": correct,
+                            "accuracy": correct / len(labeled) if labeled else None},
+                "results": results,
+            }, str(category_output), "all")
         elapsed = time.perf_counter() - started
-        results = result.get("results", [])
         category_results[scenario["name"]] = results
         total_results.extend(results)
         total_elapsed += elapsed
@@ -363,6 +393,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "dataset_root": str(args.dataset_root.resolve()),
         "train_count": args.train_count,
         "test_count": args.test_count,
+        "tree_block_size": args.tree_block_size if args.selection_source == "selector" else None,
         "selection_source": args.selection_source,
         "selection_path": (
             str(args.selection_path.resolve())
@@ -404,6 +435,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=Path("res/separate_evaluation"))
     parser.add_argument("--train-count", type=int, default=50)
     parser.add_argument("--test-count", type=int, default=150)
+    parser.add_argument("--tree-block-size", type=int, default=50,
+                        help="Selector 每轮预测条数，默认 50；轮末样本加入下一轮训练集")
     parser.add_argument("--selection-source", choices=("selector", "file"), default="selector",
                         help="默认 selector 每次重新生成 Tree 特征配置，file 读取已有配置")
     parser.add_argument("--selection-path", type=Path,
@@ -422,8 +455,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
-    if args.train_count <= 0 or args.test_count <= 0:
-        parser.error("--train-count 和 --test-count 必须大于 0")
+    if min(args.train_count, args.test_count, args.tree_block_size) <= 0:
+        parser.error("--train-count、--test-count 和 --tree-block-size 必须大于 0")
     try:
         report = run(args)
     except (OSError, TypeError, ValueError, RuntimeError) as exc:

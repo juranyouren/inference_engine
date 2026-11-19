@@ -46,11 +46,14 @@ class FixedSplitSelectionTests(unittest.TestCase):
         tree_runs = []
 
         def tree_once(**kwargs):
-            self.assertEqual(kwargs["train_indices"], list(range(50)))
-            self.assertEqual(kwargs["infer_indices"], list(range(50, 200)))
-            self.assertEqual(kwargs["selection"]["log"], ["syslog_brief:late_event"])
+            start = kwargs["infer_indices"][0]
+            self.assertEqual(kwargs["train_indices"], list(range(start)))
+            self.assertEqual(kwargs["infer_indices"], list(range(start, min(start + args.tree_block_size, 200))))
+            self.assertEqual(set(kwargs["selection"]["log"]), {
+                f"syslog_brief:block_{i // 50}" for i in range(start)
+            })
             tree_runs.append(kwargs)
-            return {"results": []}
+            return {"results": [{"case_idx": i, "groundtruth": "x", "rank": 1} for i in kwargs["infer_indices"]]}
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -68,10 +71,7 @@ class FixedSplitSelectionTests(unittest.TestCase):
                         "semantic_labels": {
                             "root_cause": {"category": "PRIVATE_TRUTH"},
                             "anomaly_logs": {
-                                "syslog_brief": (
-                                    {"TEST_EVIDENCE": 1} if index >= 50 else
-                                    {"late_event": 1} if index == 49 else {}
-                                ),
+                                "syslog_brief": {f"block_{index // 50}": 1},
                             },
                         },
                     }
@@ -93,32 +93,36 @@ class FixedSplitSelectionTests(unittest.TestCase):
                 "llm_inference.selector_refiner.LLMEngine.get_instance", return_value=engine,
             ) as get_engine, patch(
                 "inference.selection.load_alarm_template_compat", side_effect=AssertionError("external template"),
-            ), patch("inference.tree.run_tree_once", side_effect=tree_once):
+            ), patch("inference.tree.run_tree_once", side_effect=tree_once), patch("inference.common.save_csv"):
                 run(args)
                 get_engine.assert_called_once_with(
                     model_path="current-model", gpu_memory_utilization=0.9, max_model_len=100000,
                 )
                 self.assertEqual(os.environ["ASCEND_RT_VISIBLE_DEVICES"], "2,3")
+                args.tree_block_size = 60
                 run(args)
 
-            self.assertEqual(len(tree_runs), 4)
-            self.assertEqual(len(engine.llm.prompts), 4)
-            for prompt in engine.llm.prompts:
+            self.assertEqual([len(call["train_indices"]) for call in tree_runs],
+                             [50, 100, 150] * 2 + [50, 110, 170] * 2)
+            self.assertEqual(len(engine.llm.prompts), 12)
+            for prompt, call in zip(engine.llm.prompts, tree_runs):
                 self.assertIn("CURRENT_DATASET_SOP", prompt)
                 self.assertIn("candidate_a", prompt)
-                self.assertIn("late_event", prompt)
+                for block in range(4):
+                    self.assertEqual(f"block_{block}" in prompt, block * 50 < len(call["train_indices"]))
                 self.assertNotIn("PRIVATE_TRUTH", prompt)
-                self.assertNotIn("TEST_EVIDENCE", prompt)
                 self.assertNotIn("STALE_SELECTION", prompt)
             for category in ("category_a", "category_b"):
-                output = root / "output" / "tree" / category
-                selection = json.loads((output / "selection.json").read_text(encoding="utf-8"))
-                self.assertEqual(selection["log"], ["syslog_brief:late_event"])
-                self.assertTrue((output / "selector" / "prompt_0.txt").is_file())
-                self.assertTrue((output / "selector" / "records.json").is_file())
-                source = json.loads((output / "selector" / "source.json").read_text(encoding="utf-8"))
-                self.assertEqual(source["feature_catalog"]["syslog_brief"], ["late_event"])
-                self.assertEqual(source["train_indices"], list(range(50)))
+                folder = root / "output" / "tree" / category
+                predictions = json.loads((folder / "predictions.json").read_text(encoding="utf-8"))
+                self.assertEqual([r["case_idx"] for r in predictions["results"]], list(range(50, 200)))
+                for number, start in enumerate((50, 110, 170), start=1):
+                    output = folder / f"round_{number:02d}"
+                    self.assertTrue((output / "selection.json").is_file())
+                    self.assertTrue((output / "selector" / "prompt_0.txt").is_file())
+                    source = json.loads((output / "selector" / "source.json").read_text(encoding="utf-8"))
+                    self.assertEqual(source["train_indices"], list(range(start)))
+                    self.assertEqual(source["test_indices"], list(range(start, min(start + 60, 200))))
 
     def test_syslog_counts_kpi_aliases_and_alarm_window(self):
         def segment(start, value):

@@ -30,15 +30,15 @@ bash run_all_inference_modes.sh \
   --ascend-devices 6,7 --import-top-level-sop
 ```
 
-Tree 用每类前 50 条训练一次。Tree 和 Cooperation 使用接下来的 150 条测试，Competition 使用其中有 SOP 的样本，其余计入 `skipped_count`。两个 Agent 共用同一个 LLM 实例。SOP 已在 `semantic_labels.sop` 时可省略 `--import-top-level-sop`。
+Tree 默认从每类前 50 条起步，分三轮用前 50、100、150 条重新选特征并训练，每轮预测随后 50 条。每条样本只在首次预测时计分。Cooperation 评测同一组 150 条，Competition 使用其中有 SOP 的样本，其余计入 `skipped_count`。两个 Agent 共用同一个 LLM 实例。SOP 已在 `semantic_labels.sop` 时可省略 `--import-top-level-sop`。
 
-Tree 汇总每类整个训练集的字段、SOP 和显式候选根因，调用一次 Selector，按训练集中出现的事件和 KPI 固定特征列。测试样本缺少的计数记为 0。特征配置保存在 `res/fixed_split/tree/<类别>/selection.json`，该目录的 `selector/source.json` 记录训练索引和字段全集。各类别共享一次 Selector 模型初始化，`--model-path` 和 `--ascend-devices` 同时适用于 Selector。真实根因只用于 Tree 监督训练和评分。
+每轮 Selector 仅使用已到达的训练样本字段、SOP 和显式候选根因。配置保存在 `tree/<类别>/round_01/selection.json` 等目录，每轮的 `selector/source.json` 记录训练索引、预测索引和字段全集。类别目录下的 `predictions.csv` 汇总各轮原始排名。所有轮次和类别共享同一个 Selector 引擎。真实根因只用于 Tree 监督训练和评分。`--tree-block-size` 默认 50，设为 150 可在默认测试窗口上复现单轮固定切分。`--selection-source file` 使用初始训练集训练一次。
 
 只重跑 Tree，重新生成 selection 并评测决策树的原始排名：
 
 ```bash
 bash run_tree_only.sh /home/sbp/deploy/case_pool/anomalydetect_label_0 \
-  res/tree_rerun --ascend-devices 6,7
+  res/tree_rounds --ascend-devices 6,7
 ```
 
 各模式的预测、明细和指标写入 `res/fixed_split/<mode>/`，整体指标写入输出根目录。需要读取已有配置时可显式传入 `--selection-source file --selection-path /path/to/selections`。
