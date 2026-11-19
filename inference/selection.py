@@ -240,20 +240,24 @@ def load_alarm_template_compat(alarm_type: str):
 def generate_selection_by_selector(
     scenario: Dict[str, Any],
     output_dir: str,
+    *,
+    engine=None,
+    template: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     LLMEngine, Selector, _Refiner = _lazy_import_selector_refiner()
 
-    model_path = getattr(config, "MODEL_PATH")
     selector_ex_num = getattr(config, "SELECTOR_EX_NUM", 1)
 
-    engine = LLMEngine.get_instance(
-        model_path=model_path,
-        gpu_memory_utilization=0.9,
-        max_model_len=16384,
-    )
+    if engine is None:
+        engine = LLMEngine.get_instance(
+            model_path=getattr(config, "MODEL_PATH"),
+            gpu_memory_utilization=0.9,
+            max_model_len=16384,
+        )
     selector = Selector(engine, "SELECTOR")
 
-    template = load_alarm_template_compat(scenario["alarm_type"])
+    if template is None:
+        template = load_alarm_template_compat(scenario["alarm_type"])
 
     selector_output_dir = os.path.join(output_dir, "selector")
     ensure_dir(selector_output_dir)

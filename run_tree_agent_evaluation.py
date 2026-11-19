@@ -5,13 +5,15 @@
     python run_tree_agent_evaluation.py \
       --dataset-root /path/to/anomalydetect_label \
       --mode tree \
-      --selection-path /path/to/anomalydetect_label \
+      --ascend-devices 6,7 \
       --output-dir /path/to/results
     python run_tree_agent_evaluation.py --dataset-root /path/to/labels --mode competition
     python run_tree_agent_evaluation.py --dataset-root /path/to/labels --mode cooperation
 
 --dataset-root 下每个直接子目录视为一个告警类别；也兼容直接包含 label 文件的单类别目录。
 每类按 label index 升序取前 50 条训练 Tree，紧接着的 150 条作为测试窗口。
+Tree 默认每次使用当前类别首个训练样本调用 Selector 重新生成 selection。
+生成结果及 Selector 输入输出保存到 output-dir/tree/<类别>/。
 Competition 处理测试窗口中有 semantic_labels.sop 的样本。SOP 在 JSON 顶层时，
 可传 --import-top-level-sop。Cooperation 使用同一测试窗口，并从模型输入中移除 SOP。
 真实 root_cause 供 Tree 训练和结果评测使用。
@@ -40,8 +42,8 @@ from inference.common import (
     save_json,
 )
 from inference.metrics import calculate_metrics
-from inference.selection import load_selection
-from llm_interfaces.data_adapter import read_sop, with_top_level_sop, without_sop
+from inference.selection import generate_selection_by_selector, load_selection
+from llm_interfaces.data_adapter import normalize_case, read_sop, with_top_level_sop, without_sop
 from llm_interfaces.io_utils import safe_category_name, save_batch_results
 
 
@@ -155,6 +157,17 @@ def run_tree(
 ) -> List[Dict[str, Any]]:
     from inference.tree import run_tree_once
 
+    engine = None
+    if args.selection_source == "selector":
+        _configure_devices(args.ascend_devices)
+        from llm_inference.selector_refiner import LLMEngine
+
+        engine = LLMEngine.get_instance(
+            model_path=args.model_path,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+        )
+
     rows = []
     category_results = {}
     total_results = []
@@ -167,9 +180,37 @@ def run_tree(
         reader = IndexedCaseReader(scenario["data_dir"], scenario["alarm_type"])
         train_cases = reader.load_cases(train_indices)
         test_cases = reader.load_cases(test_indices)
-        selection = load_selection(scenario, str(selection_root))
         category_output = output_dir / safe_category_name(scenario["name"])
         started = time.perf_counter()
+        if args.selection_source == "selector":
+            first_index = train_indices[0]
+            label = _load_label(Path(scenario["label_map"][first_index]), first_index)
+            if args.import_top_level_sop:
+                label = with_top_level_sop(label)
+            case = normalize_case(
+                label,
+                input_index=first_index,
+                mode="competition" if read_sop(label) else "cooperation",
+                alarm_type=scenario["alarm_type"],
+            )
+            template = {
+                "alarm_type": case.alarm_type,
+                "alarm_time": case.alarm_time,
+                "semantic_labels": case.semantic_labels,
+                "sop": case.sop,
+                "root_cause_candidates": case.root_cause_candidates,
+            }
+            selection = generate_selection_by_selector(
+                scenario, str(category_output), engine=engine, template=template,
+            )
+            save_json({
+                "label_file_path": label["_label_file_path"],
+                "input_index": first_index,
+                "train_indices": train_indices,
+            }, str(category_output / "selector" / "source.json"))
+        else:
+            selection = load_selection(scenario, str(selection_root))
+        save_json(selection, str(category_output / "selection.json"))
         result = run_tree_once(
             scenario=scenario,
             train_cases=train_cases,
@@ -307,7 +348,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "dataset_root": str(args.dataset_root.resolve()),
         "train_count": args.train_count,
         "test_count": args.test_count,
-        "selection_path": str(args.selection_path.resolve()) if args.selection_path else None,
+        "selection_source": args.selection_source,
+        "selection_path": (
+            str(args.selection_path.resolve())
+            if args.selection_source == "file" and args.selection_path else None
+        ),
         "import_top_level_sop": args.import_top_level_sop,
         "splits": split_info,
     }
@@ -344,8 +389,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=Path("res/separate_evaluation"))
     parser.add_argument("--train-count", type=int, default=50)
     parser.add_argument("--test-count", type=int, default=150)
+    parser.add_argument("--selection-source", choices=("selector", "file"), default="selector",
+                        help="默认 selector 每次重新生成 Tree 特征配置，file 读取已有配置")
     parser.add_argument("--selection-path", type=Path,
-                        help="Tree selection.json 或包含每类 selection.json 的目录")
+                        help="selection-source=file 时的 selection.json 或包含各类配置的目录")
     parser.add_argument("--model-path", default=config.MODEL_PATH)
     parser.add_argument("--ascend-devices")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
