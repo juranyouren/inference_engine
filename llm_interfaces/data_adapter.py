@@ -22,6 +22,7 @@ class InferenceCase:
     groundtruth: str
     ttm: Any
     incident_type_description: str = ""
+    diagnostic_clue: Any = None
 
 
 def _sop_to_text(value: Any) -> str:
@@ -143,4 +144,6 @@ def normalize_case(
         groundtruth=groundtruth_category(label),
         ttm=label.get("ttm", semantic_labels.get("ttm")),
         incident_type_description=incident_type_description,
+        diagnostic_clue=next((label[key] for key in ("diagnostic_clue", "diagnostic_clues")
+                              if label.get(key) is not None), None),
     )

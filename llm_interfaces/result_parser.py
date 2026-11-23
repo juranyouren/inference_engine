@@ -21,6 +21,25 @@ def candidate_categories(candidates: Any) -> List[str]:
     return categories
 
 
+def candidate_details(candidates):
+    descriptions = {}
+    for item in candidates or []:
+        if not isinstance(item, dict):
+            continue
+        names = candidate_categories([item])
+        if not names or names[0] in descriptions:
+            continue
+        for field in ("description", "desc", "reason"):
+            value = item.get(field)
+            if isinstance(value, str) and value.strip():
+                descriptions[names[0]] = value.strip()
+                break
+    return [
+        {"category": name, "description": descriptions.get(name, "")}
+        for name in candidate_categories(candidates)
+    ]
+
+
 def _ranking_from_value(value: Any, candidate_set: set[str]) -> List[str]:
     if not isinstance(value, (list, tuple)):
         return []

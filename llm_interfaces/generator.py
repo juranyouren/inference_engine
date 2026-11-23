@@ -9,7 +9,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .invoke import vllm_invoke
+from .invoke import ContextLengthError, _get_vllm_max_model_len, vllm_invoke
 from .io_utils import save_text
 
 
@@ -26,6 +26,11 @@ class AgentStage:
 @dataclass
 class RequestFailure:
     message: str
+    context_overflow: bool = False
+
+
+def render_prompt(instruction, payload):
+    return instruction + "\n\n输入 JSON\n" + json.dumps(payload, ensure_ascii=False)
 
 
 class RCAGenerator:
@@ -48,6 +53,11 @@ class RCAGenerator:
         self.max_tokens = max_tokens
         self.prompt_safety_tokens = prompt_safety_tokens
         self._sampling_params_factory = sampling_params_factory
+
+    def exceeds_input_budget(self, instruction, payload):
+        budget = _get_vllm_max_model_len(self.llm) - self.max_tokens - self.prompt_safety_tokens
+        tokens = self.llm.get_tokenizer().encode(render_prompt(instruction, payload), add_special_tokens=False)
+        return len(tokens) > budget
 
     def generate_stage(
         self, name: str, requests: Iterable[tuple[Path, AgentRequest]],
@@ -72,7 +82,14 @@ class RCAGenerator:
             return self._invoke(name, batch, params)
         except Exception as exc:
             if len(batch) == 1:
-                return [RequestFailure(str(exc))]
+                message = str(exc)
+                overflow = isinstance(exc, ContextLengthError) or any(
+                    marker in message.lower() for marker in (
+                        "maximum context length", "context length exceeded", "exceeds the maximum model length",
+                        "exceeds the model's maximum context length", "longer than the maximum model length",
+                    )
+                )
+                return [RequestFailure(message, overflow)]
             middle = len(batch) // 2
             left = self._run_batch(name, batch[:middle], params)
             right = self._run_batch(name, batch[middle:], params)
@@ -80,7 +97,7 @@ class RCAGenerator:
 
     def _invoke(self, name, batch, params):
         prompts = [
-            instruction + "\n\n输入 JSON\n" + json.dumps(payload, ensure_ascii=False)
+            render_prompt(instruction, payload)
             for _, (_, instruction, payload) in batch
         ]
         stage_dirs = [output_dir / path for output_dir, (path, _, _) in batch]

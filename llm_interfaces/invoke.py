@@ -30,6 +30,10 @@ def _get_vllm_max_model_len(llm: Any) -> int:
     return 16384
 
 
+class ContextLengthError(ValueError):
+    """A request exceeded the available model context."""
+
+
 def _truncate_anomaly_logs_to_budget(
     tokenizer: Any,
     prompt: str,
@@ -209,7 +213,7 @@ def vllm_invoke(
     if require_complete_input and any(
         item["truncation_strategy"] == "whole_prompt_fallback" for item in stats
     ):
-        raise ValueError("压缩日志后 Agent 输入仍超出模型预算，无法保留完整的结构化输入")
+        raise ContextLengthError("压缩日志后 Agent 输入仍超出模型预算，无法保留完整的结构化输入")
     if prompt_output_paths is not None:
         if len(prompt_output_paths) != len(fitted_inputs):
             raise ValueError("prompt 输出路径数量必须与输入数量一致")

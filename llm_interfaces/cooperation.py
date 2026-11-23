@@ -6,7 +6,7 @@ from .agent_runner import (
     AgentInference, complete_ranking, final_text, request_stage, response_json,
 )
 from .cooperation_telemetry import normalize_telemetry, select_telemetry, semantic_labels_template
-from .result_parser import candidate_categories
+from .result_parser import candidate_details
 
 
 SPECIALISTS = {
@@ -54,25 +54,6 @@ AGGREGATOR_PROMPT = (
     "意见中 root_cause 为 null 表示该专家只提供证据，请结合这些证据判断候选根因。"
     "若提供候选列表，按可能性排列全部候选，每项恰好一次。"
 )
-
-
-def _candidate_details(candidates):
-    descriptions = {}
-    for item in candidates or []:
-        if not isinstance(item, dict):
-            continue
-        names = candidate_categories([item])
-        if not names or names[0] in descriptions:
-            continue
-        for field in ("description", "desc", "reason"):
-            value = item.get(field)
-            if isinstance(value, str) and value.strip():
-                descriptions[names[0]] = value.strip()
-                break
-    return [
-        {"category": name, "description": descriptions.get(name, "")}
-        for name in candidate_categories(candidates)
-    ]
 
 
 class CooperationInference(AgentInference):
@@ -176,8 +157,8 @@ class CooperationInference(AgentInference):
 
     def _case_stages(self, case, result):
         labels = normalize_telemetry(case.semantic_labels)
-        candidate_details = _candidate_details(case.root_cause_candidates)
-        candidates = [item["category"] for item in candidate_details]
+        details = candidate_details(case.root_cause_candidates)
+        candidates = [item["category"] for item in details]
         incident_description = case.incident_type_description or INCIDENT_DESCRIPTIONS.get(
             case.alarm_type, f"{case.alarm_type} 告警，结合候选根因及其描述确定诊断范围。",
         )
@@ -200,7 +181,7 @@ class CooperationInference(AgentInference):
         plan, = yield from invoke("orchestrator", [("orchestrator", ORCHESTRATOR_PROMPT, {
             "incident_type": case.alarm_type,
             "incident_type_description": incident_description,
-            "root_cause_candidates": candidate_details,
+            "root_cause_candidates": details,
             "semantic_labels_template": template,
         })])
         personas = self._personas(plan, template, result["orchestrator_issues"])

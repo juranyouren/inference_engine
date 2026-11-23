@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from .agent_runner import AgentInference, case_evidence, complete_ranking, request_stage, response_json
 from .competition_templates import load_competition_template
-from .result_parser import candidate_categories
+from .invoke import ContextLengthError
+from .result_parser import candidate_details
 
 
 VERIFIER_PROMPT = (
     "你是 Verifier。结合 case 中的原始证据、SOP 的决策条件以及每条候选诊断的"
     "节点检查状态、证据引用和根因分支置信度，独立复核每个根因。"
-    "把置信度作为参考，结合矛盾和缺失证据判断全部候选的相对可能性。"
+    "对照所有根因的详细描述和 diagnostic clues，结合原始证据比较各根因。"
+    "若只提供部分分支结论，仍须依据原始证据评估全部候选。"
     "候选 Agent 未报告的节点标为未知，请结合原始证据自行复核。"
     "根因分支置信度为 null 表示候选 Agent 未给出有效评分。"
     "只输出候选根因名称的 JSON 数组，按可能性从高到低排列，全部候选恰好出现一次。"
@@ -85,6 +87,15 @@ def _normalize_diagnosis(response, prompt, templates):
             "decisions": decisions, "conclusion": _normalize_conclusion(diagnosis.get("conclusion"))}
 
 
+def _top_conclusions(diagnoses):
+    def score(item):
+        confidence = item["conclusion"]["confidence"]
+        return -1 if confidence is None else confidence
+
+    return [{"root_cause": item["root_cause"], "conclusion": item["conclusion"]}
+            for item in sorted(diagnoses, key=score, reverse=True)[:5]]
+
+
 class CompetitionInference(AgentInference):
     """每个候选根因一个独立 Agent，Verifier 查看所有路径。"""
 
@@ -94,12 +105,16 @@ class CompetitionInference(AgentInference):
         template = load_competition_template(case.alarm_type, case.sop)
         all_decisions = template["decision_templates"]
         by_name = {entry["root_cause"]: entry for entry in template["root_cause_prompts"].values()}
-        candidates = candidate_categories(case.root_cause_candidates) or list(by_name)
+        details = candidate_details(case.root_cause_candidates) or candidate_details(list(by_name))
+        descriptions = {item['category']: item['description'] for item in details}
+        candidates = list(descriptions)
         missing = [name for name in candidates if name not in by_name]
         if missing:
             raise ValueError(f"SOP 缺少候选根因路径: {', '.join(missing)}")
 
         evidence = case_evidence(case)
+        if case.diagnostic_clue is not None:
+            evidence['diagnostic_clue'] = case.diagnostic_clue
         requests = []
         jobs = []
         for index, name in enumerate(candidates, start=1):
@@ -109,7 +124,7 @@ class CompetitionInference(AgentInference):
             )
             nodes = {node_id: all_decisions[node_id] for node_id in node_ids}
             payload = {
-                "case": evidence, "root_cause": name, "paths": entry["paths"],
+                "case": evidence, "root_cause": name, "description": descriptions[name], "paths": entry["paths"],
                 "decision_templates": nodes, "conclusion_template": entry["conclusion_template"],
             }
             requests.append((f"reasoners/candidate_{index:02d}", entry["prompt"], payload))
@@ -124,14 +139,49 @@ class CompetitionInference(AgentInference):
         verifier_payload = {
             "case": evidence,
             "root_cause_candidates": candidates,
+            "candidate_descriptions": descriptions,
             "decision_conditions": {
                 node_id: all_decisions[node_id]["condition"] for node_id in used_nodes
             },
             "diagnoses": diagnoses,
         }
-        answer, = yield from request_stage(
-            result, "verifier", [("verifier", VERIFIER_PROMPT, verifier_payload)], final=True,
-        )
+        candidate_clues = {}
+        for item in case.root_cause_candidates:
+            if isinstance(item, dict):
+                for field in ("diagnostic_clue", "diagnostic_clues"):
+                    if item.get(field) is not None:
+                        candidate_clues.setdefault(str(item.get("category", "")).strip(), {})[field] = item[field]
+        if candidate_clues:
+            verifier_payload["candidate_diagnostic_clues"] = candidate_clues
+        compact = self.generator.exceeds_input_budget(VERIFIER_PROMPT, verifier_payload)
+        if not compact:
+            result["verifier_input_mode"] = "all_branches"
+            try:
+                answer, = yield from request_stage(
+                    result, "verifier", [("verifier", VERIFIER_PROMPT, verifier_payload)], final=True,
+                )
+            except ContextLengthError:
+                compact = True
+        if compact:
+            conclusions = _top_conclusions(diagnoses)
+            result["verifier_input_mode"] = "top5_conclusions"
+            result["verifier_branches"] = [item["root_cause"] for item in conclusions]
+            verifier_payload["diagnoses"] = conclusions
+            # 多条 SOP 路径可引用同一个节点，紧凑输入只保留一份相同的证据。
+            clues_by_path = {}
+            for diagnosis in diagnoses:
+                for node in diagnosis["decisions"].values():
+                    for clue in node["diagnostic_clues"]:
+                        values = clues_by_path.setdefault(clue["path"], [])
+                        if clue["value"] not in values:
+                            values.append(clue["value"])
+            verifier_payload["branch_diagnostic_clues"] = [
+                {"path": path, "value": value}
+                for path, values in clues_by_path.items() for value in values
+            ]
+            answer, = yield from request_stage(
+                result, "verifier", [("verifier", VERIFIER_PROMPT, verifier_payload)], final=True,
+            )
         result["final_result"] = answer
         ranking = response_json(answer)
         if isinstance(ranking, dict):

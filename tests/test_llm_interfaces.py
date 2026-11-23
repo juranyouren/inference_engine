@@ -246,6 +246,8 @@ class LlmInterfaceTests(unittest.TestCase):
         engine = fake_engine()
         inference = CompetitionInference(engine, sampling_params_factory=fake_sampling_params)
         label = competition_label()
+        label["diagnostic_clue"] = {"event": "peer down"}
+        label["root_cause_candidates"][0]["description"] = "链路状态发生变化"
         with tempfile.TemporaryDirectory() as root:
             row, = inference.infer_results([label], "场景", root)
             output = Path(row["output_dir"])
@@ -255,6 +257,10 @@ class LlmInterfaceTests(unittest.TestCase):
         self.assertEqual(row["status"], "success")
         self.assertEqual(len(engine.llm.requests), 3)
         first, second, verifier = [payload for _prompt, payload in engine.llm.requests]
+        self.assertEqual(first["description"], verifier["candidate_descriptions"]["链路故障"])
+        for payload in (first, second, verifier):
+            self.assertEqual(payload["case"]["diagnostic_clue"], label["diagnostic_clue"])
+        self.assertEqual(row["verifier_input_mode"], "all_branches")
         self.assertTrue(first["paths"][0][0]["required_condition_met"])
         self.assertFalse(second["paths"][0][0]["required_condition_met"])
         self.assertEqual(verifier["diagnoses"], row["diagnoses"])
@@ -263,6 +269,38 @@ class LlmInterfaceTests(unittest.TestCase):
         self.assertEqual(verifier["case"]["semantic_labels"]["anomaly_logs"], {"message": "peer down"})
         self.assertNotIn("root_cause", verifier["case"])
         self.assertNotIn("sop", verifier["case"]["semantic_labels"])
+
+    def test_verifier_falls_back_to_five_conclusions_only_on_overflow(self):
+        names = [f"根因{i}" for i in range(7)]
+        for overflow in ("budget", "engine"):
+            with self.subTest(overflow=overflow):
+                def answer(instruction, payload):
+                    reply = default_answer(instruction, payload)
+                    if "decision_templates" in payload:
+                        reply["conclusion"]["confidence"] = names.index(payload["root_cause"]) / 10
+                        if overflow == "budget":
+                            for node in reply["decisions"].values():
+                                node["reason"] = "证" * 5000
+                    elif overflow == "engine" and len(payload["diagnoses"]) == 7:
+                        raise ValueError("maximum context length exceeded")
+                    return reply
+
+                engine = fake_engine(answer)
+                label = competition_label(names)
+                label["diagnostic_clues"] = ["原始证据"]
+                label["root_cause_candidates"][0].update(description="描述", diagnostic_clue="条件")
+                inference = CompetitionInference(engine, sampling_params_factory=fake_sampling_params)
+                with tempfile.TemporaryDirectory() as root:
+                    row, = inference.infer_results([label], "场景", root)
+                self.assertEqual(row["status"], "success")
+                self.assertEqual(row["verifier_input_mode"], "top5_conclusions")
+                payload = engine.llm.requests[-1][1]
+                self.assertEqual(row["verifier_branches"], names[:1:-1])
+                self.assertTrue(all(set(d) == {"root_cause", "conclusion"} for d in payload["diagnoses"]))
+                self.assertEqual(payload["root_cause_candidates"], names)
+                self.assertEqual(payload["candidate_descriptions"][names[0]], "描述")
+                self.assertEqual(payload["case"]["diagnostic_clue"], ["原始证据"])
+                self.assertEqual(payload["candidate_diagnostic_clues"][names[0]]["diagnostic_clue"], "条件")
 
     def test_cooperation_routes_evidence_and_stops_when_all_decline(self):
         engine = fake_engine()
@@ -677,12 +715,26 @@ class LlmInterfaceTests(unittest.TestCase):
                     json.dumps(label), encoding="utf-8",
                 )
             output_dir = Path(root) / "output"
+            (label_root / "场景A" / "场景A_1_label_extra.json").write_text(
+                json.dumps(cooperation_label()), encoding="utf-8",
+            )
             args = SimpleNamespace(
                 label_root=label_root, output_dir=output_dir, mode="both", model_path="fake-model",
                 ascend_devices="0", max_model_len=16384, batch_size=8, invoke_limit=10,
-                limit_per_category=None, import_top_level_sop=True,
+                limit_per_category=None, import_top_level_sop=True, first_category="场景B",
             )
             rows = evaluate(args)
+            starts = []
+            for _, payload in engine.llm.requests:
+                if "decision_templates" in payload:
+                    job = ("competition", payload["case"]["alarm_type"])
+                elif "semantic_labels_template" in payload:
+                    job = ("cooperation", payload["incident_type"])
+                else:
+                    continue
+                if job not in starts:
+                    starts.append(job)
+            self.assertEqual(starts[:2], [("competition", "场景B"), ("cooperation", "场景B")])
             self.assertTrue((output_dir / "metrics.csv").is_file())
             trace = output_dir / "traces" / "场景A" / "cooperation" / "场景A" / "case_000000"
             result = json.loads((trace / "result.json").read_text(encoding="utf-8"))
@@ -690,7 +742,7 @@ class LlmInterfaceTests(unittest.TestCase):
             self.assertNotIn("label_file_path", (trace / "orchestrator/prompt.txt").read_text(encoding="utf-8"))
         get_instance.assert_called_once()
         totals = [row for row in rows if row["alarm_type"] is None]
-        self.assertEqual([row["attempted_count"] for row in totals], [2, 2])
+        self.assertEqual([row["attempted_count"] for row in totals], [2, 3])
         self.assertEqual([row["failed_count"] for row in totals], [0, 0])
 
     def test_sharded_evaluation_uses_disjoint_cases_and_matches_serial_metrics(self):

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .data_adapter import groundtruth_category, normalize_case
 from .generator import AgentStage, RCAGenerator, RequestFailure
+from .invoke import ContextLengthError
 from .io_utils import (
     case_output_dir, category_output_dir, csv_result_dict, save_batch_results,
     save_case_result, save_category_csvs,
@@ -65,6 +66,8 @@ def request_stage(result, name, requests, *, final=False):
         if isinstance(response, RequestFailure):
             result.setdefault("request_issues", []).append({"stage": path, "error": response.message})
             if final:
+                if response.context_overflow:
+                    raise ContextLengthError(f"{path}: {response.message}")
                 raise RuntimeError(f"{path}: {response.message}")
             response = ""
         if final and not response:

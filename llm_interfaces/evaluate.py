@@ -94,9 +94,11 @@ def run(args):
     shard_count = getattr(args, "shard_count", 1)
     shard_index = getattr(args, "shard_index", 0)
     limit_per_mode = getattr(args, "limit_per_mode", None)
+    # 全量双模式各取适用样本；限量对照实验沿用两种模式共享的 SOP 样本集。
+    full_both = args.mode == "both" and args.limit_per_category is None and limit_per_mode is None
     groups, without_sop_count = load_groups(
         args.label_root, args.limit_per_category, args.import_top_level_sop,
-        require_sop=args.mode != "cooperation", limit_per_mode=limit_per_mode,
+        require_sop=args.mode != "cooperation" and not full_both, limit_per_mode=limit_per_mode,
         shard_count=shard_count, shard_index=shard_index,
     )
     if not groups:
@@ -110,23 +112,38 @@ def run(args):
     modes = _load_agents(args, mode_names) if groups else {}
 
     rows = []
+    first_category = getattr(args, "first_category", None)
+    jobs = [(mode, category) for mode in mode_names for category in groups]
+    jobs.sort(key=lambda job: job[1] != first_category)
+    results_by_mode = {mode: [] for mode in mode_names}
+    elapsed_by_mode = {mode: 0.0 for mode in mode_names}
+    for mode, alarm_type in jobs:
+        cases = groups[alarm_type]
+        if full_both and mode == "competition":
+            eligible = [(index, label) for index, label in cases if read_sop(label)]
+            without_sop_count += len(cases) - len(eligible)
+            if not eligible:
+                continue
+            cases = eligible
+        indices, labels = zip(*cases)
+        labels = list(labels)
+        inputs = [without_sop(label) for label in labels] if mode == "cooperation" else labels
+        trace_root = args.output_dir / "traces" / safe_category_name(alarm_type)
+        start = perf_counter()
+        results = modes[mode].infer_results(
+            inputs, alarm_type, trace_root, case_indices=indices if shard_count > 1 or full_both else None,
+        )
+        elapsed = perf_counter() - start
+        rows.append(_metrics(mode, alarm_type, results, elapsed))
+        results_by_mode[mode].extend(
+            {key: row.get(key) for key in ("status", "groundtruth", "rank_v1", "parse_strategy")}
+            for row in results
+        )
+        elapsed_by_mode[mode] += elapsed
     for mode in mode_names:
-        all_results = []
-        total_elapsed = 0.0
-        for alarm_type, cases in groups.items():
-            indices, labels = zip(*cases)
-            labels = list(labels)
-            inputs = [without_sop(label) for label in labels] if mode == "cooperation" else labels
-            trace_root = args.output_dir / "traces" / safe_category_name(alarm_type)
-            start = perf_counter()
-            results = modes[mode].infer_results(
-                inputs, alarm_type, trace_root, case_indices=indices if shard_count > 1 else None,
-            )
-            elapsed = perf_counter() - start
-            rows.append(_metrics(mode, alarm_type, results, elapsed))
-            all_results.extend(results)
-            total_elapsed += elapsed
-        rows.append(_metrics(mode, None, all_results, total_elapsed))
+        rows.append(_metrics(mode, None, results_by_mode[mode], elapsed_by_mode[mode]))
+    rows.sort(key=lambda row: mode_names.index(row["mode"]))
+
 
     _write_report(args.output_dir, {
         "mode": args.mode, "label_root": str(args.label_root.resolve()),
@@ -150,6 +167,7 @@ def main(argv=None):
     parser.add_argument("--max-model-len", type=int, default=16384)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--invoke-limit", type=int, default=10)
+    parser.add_argument("--first-category", help="优先运行该告警类别的所有已选模式")
     parser.add_argument("--limit-per-category", type=int)
     parser.add_argument(
         "--limit-per-mode", type=int, help="每种模式最多评测前 N 个符合条件的 case，跨类别及分片累计",
