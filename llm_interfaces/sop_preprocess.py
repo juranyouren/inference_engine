@@ -10,7 +10,8 @@ from typing import Any
 
 
 PROMPT_INSTRUCTIONS = (
-    "评估模板中的 root_cause，只使用 case 的语义标签和告警时间作为证据。"
+    "评估模板中的 root_cause，结合候选根因描述和 SOP 条件，检查输入 case 中所有相关信息。"
+    "diagnostic_clue_paths 提示优先检查的字段，也可引用其他相关字段。根据本例实际观测值判断条件。"
     "只输出 JSON，包含 decisions 和 conclusion 两个对象。decisions 以 paths 引用的"
     "决策 ID 为键，每个节点按 result_template 填写一次。diagnostic_clues 每项记录相关"
     "证据的具体 path 和原始 value。condition_met 是实际判断，取 true、false 或 null。"
