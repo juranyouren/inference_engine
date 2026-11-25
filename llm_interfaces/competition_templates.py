@@ -10,22 +10,22 @@ from .sop_preprocess import compile_sop
 
 
 def _procedure_graph(alarm_type, sop):
-    records = re.split(r"(?m)(?=^\s*Procedure\s+\d+:::)", sop)
+    records = re.split(r"(?m)(?=^\s*(?:Procedure|Step)\s+\d+:::)", sop)
     decisions = {}
     terminal_names = {}
     for record in records:
         if not record.strip():
             continue
         fields = record.strip().split(":::")
-        head = re.fullmatch(r"Procedure\s+(\d+)", fields[0])
+        head = re.fullmatch(r"(?:Procedure|Step)\s+(\d+)", fields[0])
         if not head or len(fields) != 4:
-            raise ValueError("SOP 必须为 Procedure Decision/Terminal 格式或结构化 SOP JSON")
+            raise ValueError("SOP 必须为 Procedure/Step Decision/Terminal 格式或结构化 SOP JSON")
         step = int(head[1])
         kind, body, branches = fields[1:]
         if step in decisions or step in terminal_names:
             raise ValueError(f"SOP 包含重复的 Procedure {step}")
         if kind == "Decision":
-            branch = re.fullmatch(r"Yes::Procedure\s+(\d+)::No::Procedure\s+(\d+)", branches)
+            branch = re.fullmatch(r"Yes::(?:Procedure|Step)\s+(\d+)::No::(?:Procedure|Step)\s+(\d+)", branches)
             if not branch:
                 raise ValueError(f"Procedure {step} 缺少 Yes 或 No 分支")
             decisions[step] = (body.strip(), int(branch[1]), int(branch[2]))

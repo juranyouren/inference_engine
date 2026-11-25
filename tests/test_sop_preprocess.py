@@ -15,6 +15,16 @@ class SopPreprocessTests(unittest.TestCase):
             (TEMPLATES_DIR / "network_device_offline.sop.json").read_text(encoding="utf-8")
         )
 
+    def test_step_and_procedure_compile_to_same_template(self):
+        from llm_interfaces.competition_templates import load_competition_template
+
+        sop = ('Procedure 1:::Decision:::检查 remote_status.'
+               ':::Yes::Procedure 2::No::Procedure 3\n\n'
+               'Procedure 2:::Terminal:::诊断根因为"未运行":::'
+               '\n\nProcedure 3:::Terminal:::诊断根因为"其他":::')
+        self.assertEqual(load_competition_template("BGP", sop),
+                         load_competition_template("BGP", sop.replace("Procedure", "Step")))
+
     def test_each_leaf_retains_all_paths_after_reconvergence(self):
         prompts = compile_sop(self.sop)["root_cause_prompts"]
         prefixes = (((1, False),), ((1, True), (2, False)))
