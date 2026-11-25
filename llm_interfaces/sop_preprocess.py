@@ -10,16 +10,24 @@ from typing import Any
 
 
 PROMPT_INSTRUCTIONS = (
-    "评估模板中的 root_cause，结合候选根因描述和 SOP 条件，检查输入 case 中所有相关信息。"
-    "diagnostic_clue_paths 提示优先检查的字段，也可引用其他相关字段。根据本例实际观测值判断条件。"
-    "只输出 JSON，包含 decisions 和 conclusion 两个对象。decisions 以 paths 引用的"
-    "决策 ID 为键，每个节点按 result_template 填写一次。diagnostic_clues 每项记录相关"
-    "证据的具体 path 和原始 value。condition_met 是实际判断，取 true、false 或 null。"
-    "required_condition_met 是路径要求。证据缺失、无法解释或冲突时填 null 并说明原因。"
-    "节点 confidence 表示对条件判断的把握，取 0 到 1，未知时填 null。"
-    "按 conclusion_template 填写 conclusion。confidence 表示该根因至少有一条路径成立的置信度，"
-    "每个根因必须给出 0 到 1 的数值，即使证据不足或存在冲突。reason 概括匹配证据及缺口。"
-    "只报告置信度和依据，根因判断和排序由 Verifier 负责。"
+    "评估给定的 root_cause。只输出一个 JSON 对象，顶层恰含 decisions 和 conclusion。\n"
+    "1. 收集 paths 中所有不同的 decision_id，逐一作为 decisions 的键。共享节点只填一次。"
+    "复制对应的 result_template，只填写模板已有字段。\n"
+    "2. 逐节点阅读 condition 和 guidance，核对设备端、时间窗、单位及比较符。"
+    "可查阅 case 的全部相关字段，diagnostic_clue_paths 是查找提示。"
+    "diagnostic_clues 填数组，每项恰含 path 和 value。以 case 为 $，填写实际字段路径和原始 JSON 值；"
+    "计算或单位换算写在 reason。没有可引用的观测时填 []；有相互矛盾的观测时分别引用。\n"
+    "3. condition_met 填条件本身的实际判断：观测足以确认条件成立填 true，足以确认不成立填 false，"
+    "缺少判定所需信息或证据冲突无法消解填 null。候选名称、描述和 required_condition_met 均不能充当观测。"
+    "节点 confidence 表示对该 true 或 false 判断的把握（0 到 1），判断为 null 时 confidence 也填 null。"
+    "reason 写明哪个观测如何满足或违反条件，或具体缺什么。\n"
+    "4. 按 conclusion_template 填 confidence 和 reason。逐条路径将每个节点的 condition_met 与该步的 "
+    "required_condition_met 对照：有明确相反的节点，该路径被反证；全部相符才完整支持；"
+    "其余为待定。多条路径任选一条成立即可。所有路径均被明确反证时根因 confidence 填 0；"
+    "有完整支持路径时按该路径证据把握评分；只有待定路径仍可能成立时给出保守的 0 到 1 数值，"
+    "说明缺口，不能把未知计为匹配。reason 点名最有依据的路径及其关键节点，或指出各路径的反证。"
+    "例如某步要求 false，观测支持 true，则该节点填 true，即使节点 confidence 很高，这条路径也被反证。"
+    "最终根因排序由 Verifier 完成。"
 )
 
 
